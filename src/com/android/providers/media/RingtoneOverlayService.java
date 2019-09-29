@@ -16,27 +16,26 @@
 
 package com.android.providers.media;
 
-import android.annotation.IdRes;
-import android.annotation.NonNull;
-import android.annotation.Nullable;
 import android.app.Service;
 import android.content.Intent;
-import android.media.MediaScannerConnection;
-import android.media.MediaScannerConnection.OnScanCompletedListener;
 import android.media.RingtoneManager;
 import android.net.Uri;
 import android.os.AsyncTask;
 import android.os.Environment;
 import android.os.FileUtils;
 import android.os.IBinder;
+import android.provider.MediaStore;
 import android.provider.Settings.System;
-import android.util.Slog;
+import android.util.Log;
+
+import androidx.annotation.IdRes;
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.util.concurrent.SynchronousQueue;
 
 /**
  * Service to copy and set customization of default sounds
@@ -76,7 +75,7 @@ public class RingtoneOverlayService extends Service {
             @NonNull final String subPath) {
         final File destDir = Environment.getExternalStoragePublicDirectory(subPath);
         if (!destDir.exists() && !destDir.mkdirs()) {
-            Slog.e(TAG, "can't create " + destDir.getAbsolutePath());
+            Log.e(TAG, "can't create " + destDir.getAbsolutePath());
             return;
         }
 
@@ -94,40 +93,15 @@ public class RingtoneOverlayService extends Service {
             } else {
                 // TODO Shall we remove any former copied resource in this case and unset
                 // the defaults if we use this event a second time to clear the data?
-                if (DEBUG) Slog.d(TAG, "Resource for " + name + " has no overlay");
+                if (DEBUG) Log.d(TAG, "Resource for " + name + " has no overlay");
             }
         } catch (IOException e) {
-            Slog.e(TAG, "Unable to open resource for " + name + ": " + e);
+            Log.e(TAG, "Unable to open resource for " + name + ": " + e);
         }
     }
 
     private Uri scanFile(@NonNull final File file) {
-        SynchronousQueue<Uri> queue = new SynchronousQueue<>();
-
-        if (DEBUG) Slog.d(TAG, "Scanning " + file.getAbsolutePath());
-        MediaScannerConnection.scanFile(this, new String[] { file.getAbsolutePath() }, null,
-                new OnScanCompletedListener() {
-                    @Override
-                    public void onScanCompleted(String path, Uri uri) {
-                        if (uri == null) {
-                            file.delete();
-                            return;
-                        }
-                        try {
-                            queue.put(uri);
-                        } catch (InterruptedException e) {
-                            Slog.w(TAG, "Unable to put new Uri in queue", e);
-                        }
-                    }
-                });
-
-        try {
-            return queue.take();
-        } catch (InterruptedException e) {
-            Slog.w(TAG, "Unable to take new Uri from queue", e);
-        }
-
-        return null;
+        return MediaStore.scanFile(this, file);
     }
 
     private void set(@NonNull final String name, @NonNull final Uri uri) {

@@ -20,8 +20,7 @@ import android.content.Context;
 import android.net.Uri;
 import android.os.Trace;
 import android.provider.MediaStore;
-
-import libcore.net.MimeMap;
+import android.webkit.MimeTypeMap;
 
 import java.io.File;
 
@@ -42,12 +41,12 @@ public class LegacyMediaScanner implements MediaScanner {
         final String path = file.getAbsolutePath();
         final String volumeName = MediaStore.getVolumeName(file);
 
-        Trace.traceBegin(Trace.TRACE_TAG_DATABASE, "scanDirectory");
+        Trace.beginSection("scanDirectory");
         try (android.media.MediaScanner scanner =
                 new android.media.MediaScanner(mContext, volumeName)) {
             scanner.scanDirectories(new String[] { path });
         } finally {
-            Trace.traceEnd(Trace.TRACE_TAG_DATABASE);
+            Trace.endSection();
         }
     }
 
@@ -56,14 +55,14 @@ public class LegacyMediaScanner implements MediaScanner {
         final String path = file.getAbsolutePath();
         final String volumeName = MediaStore.getVolumeName(file);
 
-        Trace.traceBegin(Trace.TRACE_TAG_DATABASE, "scanFile");
+        Trace.beginSection("scanFile");
         try (android.media.MediaScanner scanner =
                 new android.media.MediaScanner(mContext, volumeName)) {
             final String ext = path.substring(path.lastIndexOf('.') + 1);
             return scanner.scanSingleFile(path,
-                    MimeMap.getDefault().guessMimeTypeFromExtension(ext));
+                    MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext));
         } finally {
-            Trace.traceEnd(Trace.TRACE_TAG_DATABASE);
+            Trace.endSection();
         }
     }
 
