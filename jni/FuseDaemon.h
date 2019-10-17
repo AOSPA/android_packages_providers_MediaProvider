@@ -17,23 +17,34 @@
 #ifndef MEDIAPROVIDER_JNI_FUSEDAEMON_H_
 #define MEDIAPROVIDER_JNI_FUSEDAEMON_H_
 
-#include <android-base/macros.h>
+#include <string>
 
+#include "MediaProviderWrapper.h"
 #include "jni.h"
 
 namespace mediaprovider {
 namespace fuse {
 
 class FuseDaemon final {
-public:
+  public:
     FuseDaemon(JNIEnv* env, jobject mediaProvider);
-    ~FuseDaemon();
+
+    ~FuseDaemon() {
+        // TODO(b/135341433): Ensure daemon is stopped and all resources are cleaned up
+    }
     /**
      * Start the FUSE daemon loop that will handle filesystem calls.
      */
-    void Start(int dev_fd);
-private:
-    DISALLOW_COPY_AND_ASSIGN(FuseDaemon);
+    void Start(const int fd, const std::string& dest_path, const std::string& source_path);
+    /**
+     * Stop the FUSE daemon and clean up resources.
+     */
+    void Stop();
+
+  private:
+    FuseDaemon(const FuseDaemon&) = delete;
+    void operator=(const FuseDaemon&) = delete;
+    MediaProviderWrapper mp;
 };
 
 }  // namespace fuse
