@@ -17,6 +17,7 @@
 #include "FuseDaemon.h"
 
 #include <android-base/logging.h>
+#include <android-base/properties.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -32,6 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/inotify.h>
+#include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/param.h>
 #include <sys/resource.h>
@@ -55,9 +57,12 @@ using std::vector;
 
 // logging macros to avoid duplication.
 #define TRACE LOG(DEBUG)
-#define TRACE_FUSE(__fuse) TRACE << "[" << __fuse->dest_path << "] "
+#define TRACE_FUSE(__fuse) TRACE << "[" << __fuse->path << "] "
 
 #define FUSE_UNKNOWN_INO 0xffffffff
+
+constexpr size_t MAX_READ_SIZE = 128 * 1024;
+static constexpr const char* kPropRedactionEnabled = "persist.sys.fuse.redaction-enabled";
 
 struct handle {
     int fd;
@@ -91,8 +96,7 @@ struct node {
 /* Single FUSE mount */
 struct fuse {
     pthread_mutex_t lock;
-    string source_path;
-    string dest_path;
+    string path;
 
     __u64 next_generation;
     struct node root;
@@ -122,6 +126,12 @@ struct fuse {
      * FuseDaemon object.
      */
     mediaprovider::fuse::MediaProviderWrapper* mp;
+
+    /*
+     * Points to a range of zeroized bytes, used by pf_read to represent redacted ranges.
+     * The memory is read only and should never be modified.
+     */
+    char* zero_addr;
 };
 
 static inline const char* safe_name(struct node* n) {
@@ -331,6 +341,7 @@ static void pf_init(void* userdata, struct fuse_conn_info* conn) {
                      FUSE_CAP_ASYNC_READ | FUSE_CAP_ATOMIC_O_TRUNC | FUSE_CAP_WRITEBACK_CACHE |
                      FUSE_CAP_EXPORT_SUPPORT | FUSE_CAP_FLOCK_LOCKS);
     conn->want |= conn->capable & mask;
+    conn->max_read = MAX_READ_SIZE;
 }
 
 /*
@@ -588,7 +599,8 @@ static void pf_unlink(fuse_req_t req, fuse_ino_t parent, const char* name) {
 
     child_path = parent_path + "/" + name;
 
-    if (unlink(child_path.c_str()) < 0) {
+    errno = -fuse->mp->DeleteFile(child_path, ctx->uid);
+    if (errno) {
         fuse_reply_err(req, errno);
         return;
     }
@@ -742,6 +754,7 @@ static void pf_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi) {
     // Initialize ri as nullptr to know that redaction info has not been checked yet.
     h->ri = nullptr;
     fi->fh = ptr_to_id(h);
+    fi->keep_cache = 1;
     fuse_reply_open(req, fi);
 }
 
@@ -763,17 +776,12 @@ static bool range_contains(const RedactionRange& rr, off_t off) {
 
 /**
  * Sets the parameters for a fuse_buf that reads from memory, including flags.
- * Dynamically allocates memory of the given size, initialized with 0s and sets
- * buf.mem to point at it. Adds the pointer of the allocated memory to a vector of
- * unique_ptrs to be automatically freed later on.
+ * Makes buf->mem point to an already mapped region of zeroized memory.
+ * This memory is read only.
  */
-static void create_mem_fuse_buf(size_t size, fuse_buf* buf,
-                                std::vector<std::unique_ptr<void, decltype(free)*>>* mem_ptrs) {
+static void create_mem_fuse_buf(size_t size, fuse_buf* buf, struct fuse* fuse) {
     buf->size = size;
-    // TODO(b/140799126): consider allocating the same memory for all buffers?
-    buf->mem = calloc(size, sizeof(char));
-    // automatically free this memory
-    mem_ptrs->push_back(std::unique_ptr<void, decltype(free)*>(buf->mem, free));
+    buf->mem = fuse->zero_addr;
     buf->flags = static_cast<fuse_buf_flags>(0 /*read from fuse_buf.mem*/);
     buf->pos = -1;
     buf->fd = -1;
@@ -820,8 +828,6 @@ static void do_read_with_redaction(fuse_req_t req, size_t size, off_t off, fuse_
     bufvec.count = num_bufs;
     bufvec.idx = 0;
     bufvec.off = 0;
-    // automatically free all allocated memory buffers
-    std::vector<std::unique_ptr<void, decltype(free)*>> mem_ptrs;
 
     int rr_idx = 0;
     off_t start = off;
@@ -837,7 +843,7 @@ static void do_read_with_redaction(fuse_req_t req, size_t size, off_t off, fuse_
             // end should be the end of the redacted range, but can't be out of
             // the read request bounds
             end = std::min(static_cast<off_t>(off + size - 1), overlapping_rr->at(rr_idx).second);
-            create_mem_fuse_buf(/*size*/ end - start + 1, &(bufvec.buf[i]), &mem_ptrs);
+            create_mem_fuse_buf(/*size*/ end - start + 1, &(bufvec.buf[i]), get_fuse(req));
             ++rr_idx;
         } else {
             // Handle a non-redacted range
@@ -859,7 +865,13 @@ static void pf_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
     struct fuse* fuse = get_fuse(req);
     TRACE_FUSE(fuse) << "READ";
     if (!h->ri) {
-        h->ri = fuse->mp->GetRedactionInfo(req->ctx.uid, h->fd);
+        if (android::base::GetBoolProperty(kPropRedactionEnabled, true)) {
+            h->ri = fuse->mp->GetRedactionInfo(req->ctx.uid, h->fd);
+        } else {
+            // If redaction is not enabled, we just use empty redaction ranges
+            // which mean that we will always use do_read instead of do_read_with_redaction
+            h->ri = std::make_unique<RedactionInfo>();
+        }
         if (!h->ri) {
             errno = EIO;
             fuse_reply_err(req, errno);
@@ -983,7 +995,6 @@ static void pf_opendir(fuse_req_t req,
                        fuse_ino_t ino,
                        struct fuse_file_info* fi) {
     struct fuse* fuse = get_fuse(req);
-    TRACE_FUSE(fuse) << "OPENDIR";
     const struct fuse_ctx* ctx = fuse_req_ctx(req);
     struct node* node;
     string path;
@@ -993,7 +1004,7 @@ static void pf_opendir(fuse_req_t req,
     node = lookup_node_by_id_locked(fuse, ino);
     path = get_node_path_locked(node);
 
-    TRACE_FUSE(fuse) << "OPENDIR @ " << ino << " (" << safe_name(node) << ")";
+    TRACE_FUSE(fuse) << "OPENDIR @ " << ino << " (" << safe_name(node) << ")" << path;
     pthread_mutex_unlock(&fuse->lock);
 
     if (!node) {
@@ -1006,7 +1017,7 @@ static void pf_opendir(fuse_req_t req,
         fuse_reply_err(req, ENOMEM);
         return;
     }
-    TRACE_FUSE(fuse) << "OPENDIR " << path;
+
     h->d = opendir(path.c_str());
     if (!h->d) {
         delete h;
@@ -1171,16 +1182,19 @@ static void pf_create(fuse_req_t req,
         return;
     }
     mode = (mode & (~0777)) | 0664;
-    h->fd = open(child_path.c_str(),
-                 O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
-                 mode);
+    // TODO(b/142863102): implement mechanism to pass fi->flags to MediaProvider
+    // and use them when opening the file on the app's behalf.
+    h->fd = fuse->mp->CreateFile(child_path.c_str(), ctx->uid);
     if (h->fd < 0) {
+        errno = -h->fd;
         delete h;
+        PLOG(DEBUG) << "Could not create file: " << child_path;
         fuse_reply_err(req, errno);
         return;
     }
 
     fi->fh = ptr_to_id(h);
+    fi->keep_cache = 1;
     if (make_node_entry(req, parent_node, name, child_path, &e)) {
         fuse_reply_create(req, &e, fi);
     } else {
@@ -1280,7 +1294,7 @@ FuseDaemon::FuseDaemon(JNIEnv* env, jobject mediaProvider) : mp(env, mediaProvid
 
 void FuseDaemon::Stop() {}
 
-void FuseDaemon::Start(const int fd, const std::string& dest_path, const std::string& source_path) {
+void FuseDaemon::Start(const int fd, const std::string& path) {
     struct fuse_args args;
     struct fuse_cmdline_opts opts;
 
@@ -1288,8 +1302,8 @@ void FuseDaemon::Start(const int fd, const std::string& dest_path, const std::st
 
     struct stat stat;
 
-    if (lstat(source_path.c_str(), &stat)) {
-        LOG(ERROR) << "ERROR: failed to stat source " << source_path;
+    if (lstat(path.c_str(), &stat)) {
+        LOG(ERROR) << "ERROR: failed to stat source " << path;
         return;
     }
 
@@ -1299,29 +1313,34 @@ void FuseDaemon::Start(const int fd, const std::string& dest_path, const std::st
     }
 
     args = FUSE_ARGS_INIT(0, nullptr);
-    if (fuse_opt_add_arg(&args, source_path.c_str()) || fuse_opt_add_arg(&args, "-odebug")) {
+    if (fuse_opt_add_arg(&args, path.c_str()) || fuse_opt_add_arg(&args, "-odebug") ||
+        fuse_opt_add_arg(&args, ("-omax_read=" + std::to_string(MAX_READ_SIZE)).c_str())) {
         LOG(ERROR) << "ERROR: failed to set options";
         return;
     }
 
     struct fuse fuse_default;
     memset(&fuse_default, 0, sizeof(fuse_default));
+    memset(&fuse_default.root, 0, sizeof(fuse_default.root));
 
     pthread_mutex_init(&fuse_default.lock, NULL);
 
     fuse_default.next_generation = 0;
     fuse_default.inode_ctr = 1;
-
-    memset(&fuse_default.root, 0, sizeof(fuse_default.root));
     fuse_default.root.nid = FUSE_ROOT_ID; /* 1 */
     fuse_default.root.refcount = 2;
-    fuse_default.root.name = source_path;
-
-    fuse_default.source_path = source_path;
-
-    fuse_default.dest_path = dest_path;
-
+    fuse_default.root.name = path;
+    fuse_default.path = path;
     fuse_default.mp = &mp;
+
+    // Used by pf_read: redacted ranges are represented by zeroized ranges of bytes,
+    // so we mmap the maximum length of redacted ranges in the beginning and save memory allocations
+    // on each read.
+    fuse_default.zero_addr = static_cast<char*>(mmap(
+            NULL, MAX_READ_SIZE, PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, /*fd*/ -1, /*off*/ 0));
+    if (fuse_default.zero_addr == MAP_FAILED) {
+        LOG(FATAL) << "mmap failed - could not start fuse! errno = " << errno;
+    }
 
     umask(0);
 
@@ -1329,12 +1348,16 @@ void FuseDaemon::Start(const int fd, const std::string& dest_path, const std::st
     struct fuse_session
             * se = fuse_session_new(&args, &ops, sizeof(ops), &fuse_default);
     se->fd = fd;
-    se->mountpoint = strdup(dest_path.c_str());
+    se->mountpoint = strdup(path.c_str());
 
     // Single thread. Useful for debugging
     // fuse_session_loop(se);
     // Multi-threaded
     fuse_session_loop_mt(se, &config);
+
+    if (munmap(fuse_default.zero_addr, MAX_READ_SIZE)) {
+        PLOG(ERROR) << "munmap failed!";
+    }
 
     LOG(INFO) << "Ending fuse...";
     return;

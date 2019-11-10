@@ -18,7 +18,6 @@ package com.android.providers.media.util;
 
 import static com.android.providers.media.MediaProvider.TAG;
 
-import android.annotation.TestApi;
 import android.content.ClipDescription;
 import android.text.TextUtils;
 import android.util.Log;
@@ -34,6 +33,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Collection;
+import java.util.Locale;
 import java.util.Objects;
 
 public class FileUtils {
@@ -96,7 +96,6 @@ public class FileUtils {
      *
      * @hide
      */
-    @TestApi
     public static boolean contains(File dir, File file) {
         if (dir == null || file == null) return false;
         return contains(dir.getAbsolutePath(), file.getAbsolutePath());
@@ -302,7 +301,7 @@ public class FileUtils {
                 name = displayName.substring(0, lastDot);
                 ext = displayName.substring(lastDot + 1);
                 mimeTypeFromExt = MimeTypeMap.getSingleton().getMimeTypeFromExtension(
-                        ext.toLowerCase());
+                        ext.toLowerCase(Locale.ROOT));
             } else {
                 name = displayName;
                 ext = null;
@@ -342,6 +341,38 @@ public class FileUtils {
             return new File(parent, name);
         } else {
             return new File(parent, name + "." + ext);
+        }
+    }
+
+    public static @Nullable String extractDisplayName(@Nullable String data) {
+        if (data == null) return null;
+        if (data.endsWith("/")) {
+            data = data.substring(0, data.length() - 1);
+        }
+        return data.substring(data.lastIndexOf('/') + 1);
+    }
+
+    public static @Nullable String extractFileName(@Nullable String data) {
+        if (data == null) return null;
+        data = extractDisplayName(data);
+
+        final int lastDot = data.lastIndexOf('.');
+        if (lastDot == -1) {
+            return data;
+        } else {
+            return data.substring(0, lastDot);
+        }
+    }
+
+    public static @Nullable String extractFileExtension(@Nullable String data) {
+        if (data == null) return null;
+        data = extractDisplayName(data);
+
+        final int lastDot = data.lastIndexOf('.');
+        if (lastDot == -1) {
+            return null;
+        } else {
+            return data.substring(lastDot + 1);
         }
     }
 }

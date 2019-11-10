@@ -31,10 +31,12 @@ import static com.android.providers.media.util.PermissionUtils.checkPermissionWr
 import android.app.AppOpsManager;
 import android.content.ContentProvider;
 import android.content.Context;
+import android.content.PermissionChecker;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager.NameNotFoundException;
 import android.os.Binder;
 import android.os.Build;
+import android.os.Process;
 import android.os.SystemProperties;
 
 import com.android.providers.media.util.LongArray;
@@ -63,7 +65,7 @@ public class LocalCallingIdentity {
 
     public static LocalCallingIdentity fromExternal(Context context, int uid) {
         if (uid == 0) {
-            return forAdbdRoot();
+            return forAdbdRoot(context);
         }
         final String[] sharedPackageNames = context.getPackageManager().getPackagesForUid(uid);
         if (sharedPackageNames == null || sharedPackageNames.length == 0) {
@@ -104,13 +106,9 @@ public class LocalCallingIdentity {
         return packageName;
     }
 
-
-    private static LocalCallingIdentity forAdbdRoot() {
+    private static LocalCallingIdentity forAdbdRoot(Context context) {
         final LocalCallingIdentity ident = new LocalCallingIdentity(
-                null /*context - can be null since all permissions are resolved*/,
-                1 /*init pid*/,
-                0 /*shell uid when adb is root*/,
-                "com.android.shell");
+                context, 1 /*init pid*/, Process.SHELL_UID, "com.android.shell");
 
         ident.packageName = ident.packageNameUnchecked;
         ident.packageNameResolved = true;
@@ -122,7 +120,6 @@ public class LocalCallingIdentity {
             ident.hasPermission |= PERMISSION_IS_REDACTION_NEEDED;
         }
         ident.hasPermissionResolved = ~0;
-
         return ident;
     }
 
@@ -230,8 +227,9 @@ public class LocalCallingIdentity {
 
     private boolean isRedactionNeededInternal() {
         // System internals or callers holding permission have no redaction
-        if (hasPermission(PERMISSION_IS_SYSTEM)
-                || context.checkPermission(ACCESS_MEDIA_LOCATION, pid, uid) == PERMISSION_GRANTED) {
+        if (hasPermission(PERMISSION_IS_SYSTEM) || PermissionChecker.checkPermissionForDataDelivery(
+                context, ACCESS_MEDIA_LOCATION, pid, uid, getPackageName(), null /*message*/)
+                        == PermissionChecker.PERMISSION_GRANTED) {
             return false;
         }
         return true;

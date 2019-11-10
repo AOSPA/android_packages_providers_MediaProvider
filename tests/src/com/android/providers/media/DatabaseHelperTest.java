@@ -16,7 +16,7 @@
 
 package com.android.providers.media;
 
-import static com.android.providers.media.MediaProvider.makePristineSchema;
+import static com.android.providers.media.DatabaseHelper.makePristineSchema;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -35,8 +35,6 @@ import android.util.Log;
 import androidx.test.InstrumentationRegistry;
 import androidx.test.runner.AndroidJUnit4;
 
-import com.android.providers.media.MediaProvider.DatabaseHelper;
-
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -50,6 +48,8 @@ public class DatabaseHelperTest {
     private static final String TEST_UPGRADE_DB = "test_upgrade";
     private static final String TEST_DOWNGRADE_DB = "test_downgrade";
     private static final String TEST_CLEAN_DB = "test_clean";
+
+    private static final String SQLITE_MASTER_ORDER_BY = "type,name,tbl_name";
 
     private Context getContext() {
         return InstrumentationRegistry.getTargetContext();
@@ -66,7 +66,7 @@ public class DatabaseHelperTest {
 
     @Test
     public void testVersionCode() throws Exception {
-        assertEquals(getContext().getApplicationInfo().versionCode, MediaProvider.VERSION_R);
+        assertEquals(getContext().getApplicationInfo().versionCode, DatabaseHelper.VERSION_R);
     }
 
     @Test
@@ -289,19 +289,20 @@ public class DatabaseHelperTest {
                     .newInstance(getContext(), TEST_CLEAN_DB)) {
                 SQLiteDatabase db2 = helper2.getWritableDatabase();
 
-                try (Cursor c1 = db.query("sqlite_master", null, null, null, null, null, null);
-                        Cursor c2 = db2.query("sqlite_master", null, null, null, null, null, null)) {
+                try (Cursor c1 = db.query("sqlite_master",
+                        null, null, null, null, null, SQLITE_MASTER_ORDER_BY);
+                        Cursor c2 = db2.query("sqlite_master",
+                                null, null, null, null, null, SQLITE_MASTER_ORDER_BY)) {
                     while (c1.moveToNext() && c2.moveToNext()) {
-                        assertEquals(c2.getString(0), c1.getString(0));
-                        assertEquals(c2.getString(1), c1.getString(1));
-                        assertEquals(c2.getString(2), c1.getString(2));
-                        assertEquals(c2.getString(3), c1.getString(3));
-
                         final String sql1 = normalize(c1.getString(4));
                         final String sql2 = normalize(c2.getString(4));
                         Log.v(TAG, String.valueOf(sql1));
                         Log.v(TAG, String.valueOf(sql2));
                         assertEquals(sql2, sql1);
+
+                        assertEquals(c2.getString(0), c1.getString(0));
+                        assertEquals(c2.getString(1), c1.getString(1));
+                        assertEquals(c2.getString(2), c1.getString(2));
                     }
                     assertEquals(c1.getCount(), c2.getCount());
                 }
@@ -315,7 +316,7 @@ public class DatabaseHelperTest {
 
     private static class DatabaseHelperO extends DatabaseHelper {
         public DatabaseHelperO(Context context, String name) {
-            super(context, name, MediaProvider.VERSION_O, false, false);
+            super(context, name, DatabaseHelper.VERSION_O, false, false);
         }
 
         @Override
@@ -326,7 +327,7 @@ public class DatabaseHelperTest {
 
     private static class DatabaseHelperP extends DatabaseHelper {
         public DatabaseHelperP(Context context, String name) {
-            super(context, name, MediaProvider.VERSION_P, false, false);
+            super(context, name, DatabaseHelper.VERSION_P, false, false);
         }
 
         @Override
@@ -337,7 +338,7 @@ public class DatabaseHelperTest {
 
     private static class DatabaseHelperQ extends DatabaseHelper {
         public DatabaseHelperQ(Context context, String name) {
-            super(context, name, MediaProvider.VERSION_Q, false, false);
+            super(context, name, DatabaseHelper.VERSION_Q, false, false);
         }
 
         @Override
@@ -348,7 +349,7 @@ public class DatabaseHelperTest {
 
     private static class DatabaseHelperR extends DatabaseHelper {
         public DatabaseHelperR(Context context, String name) {
-            super(context, name, MediaProvider.VERSION_R, false, false);
+            super(context, name, DatabaseHelper.VERSION_R, false, false);
         }
     }
 

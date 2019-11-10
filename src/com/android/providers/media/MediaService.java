@@ -16,32 +16,21 @@
 
 package com.android.providers.media;
 
-import static android.media.RingtoneManager.TYPE_ALARM;
-import static android.media.RingtoneManager.TYPE_NOTIFICATION;
-import static android.media.RingtoneManager.TYPE_RINGTONE;
-
 import static com.android.providers.media.MediaProvider.TAG;
 
 import android.app.IntentService;
 import android.content.ContentProviderClient;
 import android.content.ContentResolver;
-import android.content.ContentUris;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
-import android.database.Cursor;
 import android.media.RingtoneManager;
 import android.net.Uri;
 import android.os.Environment;
 import android.os.PowerManager;
-import android.os.SystemProperties;
 import android.os.Trace;
 import android.provider.MediaStore;
-import android.provider.MediaStore.MediaColumns;
-import android.provider.Settings;
 import android.util.Log;
-
-import com.android.providers.media.scan.MediaScanner;
 
 import java.io.File;
 import java.io.FileNotFoundException;
@@ -129,12 +118,13 @@ public class MediaService extends IntentService {
         // long external storage scan
         if (MediaStore.VOLUME_EXTERNAL_PRIMARY.equals(volumeName)) {
             onScanVolume(context, Uri.fromFile(Environment.getRootDirectory()));
-            ensureDefaultRingtones(context);
+            RingtoneManager.ensureDefaultRingtones(context);
         }
 
         try (ContentProviderClient cpc = context.getContentResolver()
                 .acquireContentProviderClient(MediaStore.AUTHORITY)) {
-            ((MediaProvider) cpc.getLocalContentProvider()).attachVolume(volumeName);
+            final MediaProvider provider = ((MediaProvider) cpc.getLocalContentProvider());
+            provider.attachVolume(volumeName);
 
             final ContentResolver resolver = ContentResolver.wrap(cpc.getLocalContentProvider());
 
@@ -147,7 +137,7 @@ public class MediaService extends IntentService {
             }
 
             for (File dir : resolveDirectories(volumeName)) {
-                MediaScanner.instance(context).scanDirectory(dir);
+                provider.scanDirectory(dir);
             }
 
             resolver.delete(scanUri, null, null);
@@ -161,62 +151,15 @@ public class MediaService extends IntentService {
 
     public static Uri onScanFile(Context context, Uri uri) throws IOException {
         final File file = new File(uri.getPath()).getCanonicalFile();
-        return MediaScanner.instance(context).scanFile(file);
+        try (ContentProviderClient cpc = context.getContentResolver()
+                .acquireContentProviderClient(MediaStore.AUTHORITY)) {
+            final MediaProvider provider = ((MediaProvider) cpc.getLocalContentProvider());
+            return provider.scanFile(file);
+        }
     }
 
     private static Collection<File> resolveDirectories(String volumeName)
             throws FileNotFoundException {
         return MediaStore.getVolumeScanPaths(volumeName);
-    }
-
-    /**
-     * Ensure that we've set ringtones at least once after initial scan.
-     */
-    private static void ensureDefaultRingtones(Context context) {
-        for (int type : new int[] {
-                TYPE_RINGTONE,
-                TYPE_NOTIFICATION,
-                TYPE_ALARM,
-        }) {
-            // Skip if we've already defined it at least once, so we don't
-            // overwrite the user changing to null
-            final String setting = getDefaultRingtoneSetting(type);
-            if (Settings.System.getInt(context.getContentResolver(), setting, 0) != 0) {
-                continue;
-            }
-
-            // Try finding the scanned ringtone
-            final String filename = getDefaultRingtoneFilename(type);
-            final Uri baseUri = MediaStore.Audio.Media.INTERNAL_CONTENT_URI;
-            try (Cursor cursor = context.getContentResolver().query(baseUri,
-                    new String[] { MediaColumns._ID },
-                    MediaColumns.DISPLAY_NAME + "=?",
-                    new String[] { filename }, null)) {
-                if (cursor.moveToFirst()) {
-                    final Uri ringtoneUri = context.getContentResolver().canonicalizeOrElse(
-                            ContentUris.withAppendedId(baseUri, cursor.getLong(0)));
-                    RingtoneManager.setActualDefaultRingtoneUri(context, type, ringtoneUri);
-                    Settings.System.putInt(context.getContentResolver(), setting, 1);
-                }
-            }
-        }
-    }
-
-    private static String getDefaultRingtoneSetting(int type) {
-        switch (type) {
-            case TYPE_RINGTONE: return "ringtone_set";
-            case TYPE_NOTIFICATION: return "notification_sound_set";
-            case TYPE_ALARM: return "alarm_alert_set";
-            default: throw new IllegalArgumentException();
-        }
-    }
-
-    private static String getDefaultRingtoneFilename(int type) {
-        switch (type) {
-            case TYPE_RINGTONE: return SystemProperties.get("ro.config.ringtone");
-            case TYPE_NOTIFICATION: return SystemProperties.get("ro.config.notification_sound");
-            case TYPE_ALARM: return SystemProperties.get("ro.config.alarm_alert");
-            default: throw new IllegalArgumentException();
-        }
     }
 }

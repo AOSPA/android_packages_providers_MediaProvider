@@ -16,12 +16,13 @@
 
 package com.android.providers.media.fuse;
 
-import android.annotation.NonNull;
 import android.content.ContentProviderClient;
 import android.content.ContentResolver;
 import android.os.OperationCanceledException;
 import android.os.ParcelFileDescriptor;
 import android.provider.MediaStore;
+
+import androidx.annotation.NonNull;
 
 import com.android.internal.util.Preconditions;
 import com.android.providers.media.MediaProvider;
@@ -33,20 +34,21 @@ public final class FuseDaemon implements Runnable {
     public static final String TAG = "FuseDaemon";
 
     private final Object mLock = new Object();
+    private final ExternalStorageServiceImpl mService;
+    private final String mSessionId;
     private final int mFuseDeviceFd;
-    private final String mUpperPath;
-    private final String mLowerPath;
+    private final String mPath;
     private long mNativeFuseDaemon;
 
-    public FuseDaemon(@NonNull ContentResolver resolver, @NonNull ParcelFileDescriptor fd,
-            @NonNull String upperPath, @NonNull String lowerPath) {
-        Preconditions.checkNotNull(fd);
-        Preconditions.checkNotNull(upperPath);
-        Preconditions.checkNotNull(lowerPath);
+    public FuseDaemon(@NonNull ContentResolver resolver, @NonNull String sessionId,
+            @NonNull ExternalStorageServiceImpl service, @NonNull ParcelFileDescriptor fd,
+            @NonNull String path) {
+        Preconditions.checkNotNull(resolver);
+        mService = Preconditions.checkNotNull(service);
+        mSessionId = Preconditions.checkNotNull(sessionId);;
+        mFuseDeviceFd = Preconditions.checkNotNull(fd).detachFd();
+        mPath = Preconditions.checkNotNull(path);
 
-        mFuseDeviceFd = fd.detachFd();
-        mUpperPath = upperPath;
-        mLowerPath = lowerPath;
         try (ContentProviderClient cpc =
                 resolver.acquireContentProviderClient(MediaStore.AUTHORITY)) {
             mNativeFuseDaemon = native_new((MediaProvider) cpc.getLocalContentProvider());
@@ -58,9 +60,8 @@ public final class FuseDaemon implements Runnable {
     /** Starts a FUSE session. Does not return until {@link #stop} is called. */
     @Override
     public void run() {
-        // TODO(b/135341433): Ensure no overlap between lower and upper path
-        native_start(mNativeFuseDaemon, mFuseDeviceFd, mUpperPath, mLowerPath);
-        // TODO(b/135341433): Remove from mFuseDaemons in ExternalStorageServiceImpl and #stopSelf
+        native_start(mNativeFuseDaemon, mFuseDeviceFd, mPath);
+        mService.onEndSession(mSessionId);
     }
 
     /** Stops any running FUSE sessions, causing {@link #run} to return. */
@@ -80,7 +81,7 @@ public final class FuseDaemon implements Runnable {
     }
 
     private native long native_new(MediaProvider mediaProvider);
-    private native void native_start(long daemon, int deviceFd, String upperPath, String lowerPath);
+    private native void native_start(long daemon, int deviceFd, String path);
     private native void native_stop(long daemon);
     private native void native_delete(long daemon);
 }
