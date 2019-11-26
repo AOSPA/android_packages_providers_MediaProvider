@@ -20,7 +20,6 @@ import static android.app.PendingIntent.FLAG_CANCEL_CURRENT;
 import static android.app.PendingIntent.FLAG_IMMUTABLE;
 import static android.app.PendingIntent.FLAG_ONE_SHOT;
 import static android.content.pm.PackageManager.PERMISSION_GRANTED;
-import static android.provider.MediaStore.AUTHORITY;
 import static android.provider.MediaStore.getVolumeName;
 import static android.provider.MediaStore.Downloads.isDownload;
 
@@ -59,6 +58,7 @@ import android.content.UriMatcher;
 import android.content.pm.PackageManager;
 import android.content.pm.PackageManager.NameNotFoundException;
 import android.content.pm.PermissionGroupInfo;
+import android.content.pm.ProviderInfo;
 import android.content.res.AssetFileDescriptor;
 import android.content.res.Configuration;
 import android.content.res.Resources;
@@ -177,6 +177,12 @@ import java.util.regex.Pattern;
  */
 public class MediaProvider extends ContentProvider {
     /**
+     * Regex that matches any valid path in external storage,
+     * and captures the top-level directory as the first group.
+     */
+    static final Pattern PATTERN_TOP_LEVEL_DIR = Pattern.compile(
+            "(?i)^/storage/[^/]+/[0-9]+/?([^/]+)/.*");
+    /**
      * Regex that matches paths in all well-known package-specific directories,
      * and which captures the package name as the first group.
      */
@@ -201,6 +207,23 @@ public class MediaProvider extends ContentProvider {
      */
     static final Pattern PATTERN_SELECTION_ID = Pattern.compile(
             "(?:image_id|video_id)\\s*=\\s*(\\d+)");
+
+    /**
+     * These directory names aren't declared in Environment as final variables, and so we need to
+     * have the same values in separate final variables in order to have them considered constant
+     * expressions.
+     */
+    private static final String DIRECTORY_MUSIC = "Music";
+    private static final String DIRECTORY_PODCASTS = "Podcasts";
+    private static final String DIRECTORY_RINGTONES = "Ringtones";
+    private static final String DIRECTORY_ALARMS = "Alarms";
+    private static final String DIRECTORY_NOTIFICATIONS = "Notifications";
+    private static final String DIRECTORY_PICTURES = "Pictures";
+    private static final String DIRECTORY_MOVIES = "Movies";
+    private static final String DIRECTORY_DOWNLOADS = "Download";
+    private static final String DIRECTORY_DCIM = "DCIM";
+    private static final String DIRECTORY_DOCUMENTS = "Documents";
+    private static final String DIRECTORY_AUDIOBOOKS = "Audiobooks";
 
     /**
      * Set of {@link Cursor} columns that refer to raw filesystem paths.
@@ -251,9 +274,13 @@ public class MediaProvider extends ContentProvider {
     }
 
     public static File getVolumePath(String volumeName) throws FileNotFoundException {
-        synchronized (sCacheLock) {
-            return MediaStore.getVolumePath(sCachedVolumes, volumeName);
-        }
+        // TODO(b/144275217): A more performant invocation is
+        // MediaStore#getVolumePath(sCachedVolumes, volumeName) since we avoid a binder
+        // to StorageManagerService to getVolumeList. We need to delay the mount broadcasts
+        // from StorageManagerService so that sCachedVolumes is up to date in
+        // onVolumeStateChanged before we to call this method, otherwise we would crash
+        // when we don't find volumeName yet
+        return MediaStore.getVolumePath(volumeName);
     }
 
     public static Set<String> getExternalVolumeNames() {
@@ -371,7 +398,7 @@ public class MediaProvider extends ContentProvider {
      * this method expands the single item being accepted to also accept all
      * relevant views.
      */
-    public static void acceptWithExpansion(Consumer<Uri> consumer, Uri uri) {
+    public void acceptWithExpansion(Consumer<Uri> consumer, Uri uri) {
         final int match = matchUri(uri, true);
         acceptWithExpansionInternal(consumer, uri, match);
 
@@ -478,7 +505,7 @@ public class MediaProvider extends ContentProvider {
             final File path = getVolumePath(volumeName);
             final StorageVolume vol = mStorageManager.getStorageVolume(path);
             final String key;
-            if (VolumeInfo.ID_EMULATED_INTERNAL.equals(vol.getId())) {
+            if (vol == null || vol.isPrimary()) {
                 key = "created_default_folders";
             } else {
                 key = "created_default_folders_" + vol.getNormalizedUuid();
@@ -505,6 +532,16 @@ public class MediaProvider extends ContentProvider {
     }
 
     @Override
+    public void attachInfo(Context context, ProviderInfo info) {
+        super.attachInfo(context, info);
+
+        Log.v(TAG, "Attached " + info.authority + " from " + info.applicationInfo.packageName);
+
+        mLegacyProvider = Objects.equals(info.authority, MediaStore.AUTHORITY_LEGACY);
+        mUriMatcher = new LocalUriMatcher(info.authority);
+    }
+
+    @Override
     public boolean onCreate() {
         final Context context = getContext();
 
@@ -523,8 +560,10 @@ public class MediaProvider extends ContentProvider {
 
         mMediaScanner = new ModernMediaScanner(context);
 
-        mInternalDatabase = new DatabaseHelper(context, INTERNAL_DATABASE_NAME, true, false);
-        mExternalDatabase = new DatabaseHelper(context, EXTERNAL_DATABASE_NAME, false, false);
+        mInternalDatabase = new DatabaseHelper(context, INTERNAL_DATABASE_NAME,
+                true, false, mLegacyProvider);
+        mExternalDatabase = new DatabaseHelper(context, EXTERNAL_DATABASE_NAME,
+                false, false, mLegacyProvider);
 
         final IntentFilter filter = new IntentFilter();
         filter.setPriority(10);
@@ -677,6 +716,19 @@ public class MediaProvider extends ContentProvider {
 
     public Uri scanFile(File file) {
         return mMediaScanner.scanFile(file);
+    }
+
+    /**
+     * Makes MediaScanner scan the given file.
+     * @param file path of the file to be scanned
+     * @return URI of the item corresponding to the file if it was successfully scanned and indexed,
+     * null otherwise.
+     *
+     * Called from JNI in jni/MediaProviderWrapper.cpp
+     */
+    @Keep
+    public Uri scanFile(String file) {
+        return scanFile(new File(file));
     }
 
     private void enforceShellRestrictions() {
@@ -1198,7 +1250,9 @@ public class MediaProvider extends ContentProvider {
 
     @VisibleForTesting
     static void ensureFileColumns(Uri uri, ContentValues values) throws VolumeArgumentException {
-        ensureNonUniqueFileColumns(matchUri(uri, true), uri, values, null /* currentPath */);
+        final LocalUriMatcher matcher = new LocalUriMatcher(MediaStore.AUTHORITY);
+        final int match = matcher.matchUri(uri, true);
+        ensureNonUniqueFileColumns(match, uri, values, null /* currentPath */);
     }
 
     private static void ensureUniqueFileColumns(int match, Uri uri, ContentValues values)
@@ -1420,6 +1474,11 @@ public class MediaProvider extends ContentProvider {
             return new String[0];
         } else {
             final String[] segments = path.split("/");
+            // If the path corresponds to the top level directory, then we return an empty path
+            // which denotes the top level directory
+            if (segments.length == 0) {
+                return new String[] { "" };
+            }
             for (int i = 0; i < segments.length; i++) {
                 segments[i] = sanitizeDisplayName(segments[i]);
             }
@@ -2909,6 +2968,12 @@ public class MediaProvider extends ContentProvider {
             if (getCallingPackageTargetSdkVersion() < Build.VERSION_CODES.Q) {
                 qb.setProjectionGreylist(sGreylist);
             }
+
+            // If we're the legacy provider, and the caller is the system, then
+            // we're willing to let them access any columns they want
+            if (mLegacyProvider && isCallingPackageSystem()) {
+                qb.setProjectionGreylist(sGreylist);
+            }
         }
 
         return qb;
@@ -2918,7 +2983,7 @@ public class MediaProvider extends ContentProvider {
      * Determine if given {@link Uri} has a
      * {@link MediaColumns#OWNER_PACKAGE_NAME} column.
      */
-    private static boolean hasOwnerPackageName(Uri uri) {
+    private boolean hasOwnerPackageName(Uri uri) {
         // It's easier to maintain this as an inverted list
         final int table = matchUri(uri, true);
         switch (table) {
@@ -3891,31 +3956,33 @@ public class MediaProvider extends ContentProvider {
 
         final ContentValues values = new ContentValues(initialValues);
         switch (match) {
-            case AUDIO_MEDIA:
             case AUDIO_MEDIA_ID: {
                 computeAudioLocalizedValues(values);
                 computeAudioKeyValues(values);
                 // fall-through
             }
-            case IMAGES_MEDIA:
+            case AUDIO_PLAYLISTS_ID:
+            case VIDEO_MEDIA_ID:
             case IMAGES_MEDIA_ID:
-            case VIDEO_MEDIA:
-            case VIDEO_MEDIA_ID: {
+            case FILES_ID:
+            case DOWNLOADS_ID: {
                 computeDataValues(values);
-                count = qb.update(db, values, userWhere, userWhereArgs);
                 break;
             }
+        }
+
+        switch (match) {
             case AUDIO_MEDIA_ID_PLAYLISTS_ID:
             case AUDIO_PLAYLISTS_ID:
                 long playlistId = ContentUris.parseId(uri);
-                count = qb.update(db, initialValues, userWhere, userWhereArgs);
+                count = qb.update(db, values, userWhere, userWhereArgs);
                 if (count > 0) {
                     updatePlaylistDateModifiedToNow(db, playlistId);
                 }
                 break;
             case AUDIO_PLAYLISTS_ID_MEMBERS:
                 long playlistIdMembers = Long.parseLong(uri.getPathSegments().get(3));
-                count = qb.update(db, initialValues, userWhere, userWhereArgs);
+                count = qb.update(db, values, userWhere, userWhereArgs);
                 if (count > 0) {
                     updatePlaylistDateModifiedToNow(db, playlistIdMembers);
                 }
@@ -3924,8 +3991,8 @@ public class MediaProvider extends ContentProvider {
                 String moveit = uri.getQueryParameter("move");
                 if (moveit != null) {
                     String key = MediaStore.Audio.Playlists.Members.PLAY_ORDER;
-                    if (initialValues.containsKey(key)) {
-                        int newpos = initialValues.getAsInteger(key);
+                    if (values.containsKey(key)) {
+                        int newpos = values.getAsInteger(key);
                         List <String> segments = uri.getPathSegments();
                         long playlist = Long.parseLong(segments.get(3));
                         int oldpos = Integer.parseInt(segments.get(5));
@@ -3941,7 +4008,7 @@ public class MediaProvider extends ContentProvider {
                 }
                 // fall through
             default:
-                count = qb.update(db, initialValues, userWhere, userWhereArgs);
+                count = qb.update(db, values, userWhere, userWhereArgs);
                 break;
         }
 
@@ -4260,6 +4327,20 @@ public class MediaProvider extends ContentProvider {
     }
 
     /**
+     * Compares {@code itemOwner} with package name of {@link LocalCallingIdentity} and throws
+     * {@link IllegalStateException} if it doesn't match.
+     * Make sure to set calling identity properly before calling.
+     */
+    private void requireOwnershipForItem(@Nullable String itemOwner, Uri item) {
+        final boolean hasOwner = (itemOwner != null);
+        final boolean callerIsOwner = Objects.equals(getCallingPackageOrSelf(), itemOwner);
+        if (hasOwner && !callerIsOwner) {
+            throw new IllegalStateException(
+                    "Only owner is able to interact with pending item " + item);
+        }
+    }
+
+    /**
      * Replacement for {@link #openFileHelper(Uri, String)} which enforces any
      * permissions applicable to the path before returning.
      */
@@ -4296,14 +4377,11 @@ public class MediaProvider extends ContentProvider {
 
         checkAccess(uri, file, forWrite);
 
-        // Require ownership if item is still pending
-        final boolean hasOwner = (ownerPackageName != null);
-        final boolean callerIsOwner = Objects.equals(getCallingPackageOrSelf(), ownerPackageName);
-        if (isPending && hasOwner && !callerIsOwner) {
-            throw new IllegalStateException(
-                    "Only owner is able to interact with pending media " + uri);
+        if (isPending) {
+            requireOwnershipForItem(ownerPackageName, uri);
         }
 
+        final boolean callerIsOwner = Objects.equals(getCallingPackageOrSelf(), ownerPackageName);
         // Figure out if we need to redact contents
         final boolean redactionNeeded = callerIsOwner ? false : isRedactionNeeded(uri);
         final RedactionInfo redactionInfo;
@@ -4471,7 +4549,7 @@ public class MediaProvider extends ContentProvider {
      * access the file.
      *
      * @param uid UID of the package wanting to access the file
-     * @param fd File descriptor of the file to be read
+     * @param path File path
      * @return Ranges that should be redacted.
      *
      * @throws IOException if an error occurs while calculating the redaction ranges
@@ -4549,28 +4627,137 @@ public class MediaProvider extends ContentProvider {
     }
 
     /**
+     * Checks if the app identified by the given UID is allowed to open the given file for the given
+     * access mode.
+     *
+     * @param path the path of the file to be opened
+     * @param uid UID of the app requesting to open the file
+     * @param forWrite specifies if the file is to be opened for write
+     * @return 0 upon success. If the operation is illegal or not permitted, returns
+     * -{@link OsConstants#ENOENT} to prevent malicious apps from distinguishing whether a file
+     * they have no access to exists or not.
+     *
+     * Called from JNI in jni/MediaProviderWrapper.cpp
+     */
+    @Keep
+    public int isOpenAllowed(String path, int uid, boolean forWrite) {
+        final LocalCallingIdentity token =
+                clearLocalCallingIdentity(LocalCallingIdentity.fromExternal(getContext(), uid));
+        try {
+            // Returns null if the path doesn't correspond to an app specific directory
+            final String appSpecificDir = extractPathOwnerPackageName(path);
+
+            if (appSpecificDir != null) {
+                return checkAppSpecificDirAccess(appSpecificDir);
+            }
+            final String mimeType = MediaFile.getMimeTypeForFile(path);
+            final Uri contentUri = getContentUriForFile(path, mimeType);
+            final String[] projection = new String[]{
+                    MediaColumns._ID,
+                    MediaColumns.OWNER_PACKAGE_NAME,
+                    MediaColumns.IS_PENDING};
+            final String selection = MediaColumns.DATA + "=?";
+            final String[] selectionArgs = new String[] { path };
+            final Uri fileUri;
+            boolean isPending = false;
+            String ownerPackageName = null;
+            try (final Cursor c = queryForSingleItem(contentUri, projection, selection,
+                    selectionArgs, null)) {
+                fileUri = ContentUris.withAppendedId(contentUri, c.getInt(0));
+                ownerPackageName = c.getString(1);
+                isPending = c.getInt(2) != 0;
+            }
+
+            final File file = new File(path);
+            checkAccess(fileUri, file, forWrite);
+
+            if (isPending) {
+                requireOwnershipForItem(ownerPackageName, fileUri);
+            }
+            return 0;
+        } catch (FileNotFoundException e) {
+            Log.e(TAG, "Couldn't find file: " + path);
+            // It's an illegal state because FuseDaemon shouldn't forward the request if
+            // the file doesn't exist.
+            throw new IllegalStateException(e);
+        } catch (IllegalStateException | SecurityException e) {
+            Log.e(TAG, "Permission to access file: " + path + " is denied");
+            return -OsConstants.ENOENT;
+        } finally {
+            restoreLocalCallingIdentity(token);
+        }
+    }
+
+    /**
+     * Returns 0 if access is allowed, -ENOENT otherwise.
+     * <p> Assumes that {@code mCallingIdentity} has been properly set to reflect the calling
+     * package.
+     */
+    private int checkAppSpecificDirAccess(String appSpecificDir) {
+        for (String packageName : mCallingIdentity.get().getSharedPackageNames()) {
+            if (appSpecificDir.toLowerCase(Locale.ROOT)
+                    .equals(packageName.toLowerCase(Locale.ROOT))) {
+                return 0;
+            }
+        }
+        Log.e(TAG, "Cannot access file under another app's external directory!");
+        // We treat this error as if the directory doesn't exist to make it harder for
+        // apps to snoop around whether other apps exist or not.
+        return -OsConstants.ENOENT;
+    }
+
+    /**
+     * Returns the name of the top level directory, or null if the path doesn't go through the
+     * external storage directory.
+     */
+    @Nullable
+    private static String extractTopLevelDir(String path) {
+        Matcher m = PATTERN_TOP_LEVEL_DIR.matcher(path);
+        if (m.matches()) {
+            return m.group(1);
+        }
+        return null;
+    }
+
+    /**
      * @throws IllegalStateException if path is invalid or doesn't match a volume.
      */
     @NonNull
     private static Uri getContentUriForFile(@NonNull String filePath, @NonNull String mimeType) {
         final String volName = MediaStore.getVolumeName(new File(filePath));
-        // We ignore the subtype for our purposes
-        int firstSlash = mimeType.indexOf('/');
-        if (firstSlash < 0) {
-            // This shouldn't happen, but we resort to the non-media files URI as a default
+        final String topLevelDir = extractTopLevelDir(filePath);
+        if (topLevelDir == null) {
+            // If the file path doesn't match the external storage directory, we use the files URI
+            // as default and let #insert enforce the restrictions
             return Files.getContentUri(volName);
         }
-        final String type = mimeType.substring(0, firstSlash).toLowerCase(Locale.ROOT);
-        switch (type) {
-            case "image":
-                return Images.Media.getContentUri(volName);
-            case "video":
-                return Video.Media.getContentUri(volName);
-            case "audio":
+
+        switch (topLevelDir) {
+            case DIRECTORY_MUSIC:
+            case DIRECTORY_PODCASTS:
+            case DIRECTORY_RINGTONES:
+            case DIRECTORY_ALARMS:
+            case DIRECTORY_NOTIFICATIONS:
+            case DIRECTORY_AUDIOBOOKS:
                 return Audio.Media.getContentUri(volName);
+            //TODO(b/143864294)
+            case DIRECTORY_PICTURES:
+                return Images.Media.getContentUri(volName);
+            case DIRECTORY_MOVIES:
+                return Video.Media.getContentUri(volName);
+            case DIRECTORY_DCIM:
+                if (mimeType.toLowerCase(Locale.ROOT).startsWith("image")) {
+                    return Images.Media.getContentUri(volName);
+                } else {
+                    return Video.Media.getContentUri(volName);
+                }
+            case DIRECTORY_DOWNLOADS:
+            case DIRECTORY_DOCUMENTS:
+                break;
             default:
-                return Files.getContentUri(volName);
+                Log.w(TAG, "Forgot to handle a top level directory in getContentUriForFile?");
         }
+        return Files.getContentUri(volName);
     }
 
     private boolean fileExists(@NonNull String absolutePath, @NonNull Uri contentUri) {
@@ -4586,34 +4773,16 @@ public class MediaProvider extends ContentProvider {
         }
     }
 
-    private static int createFileInAppSpecificDir(@NonNull String path) {
-        try {
-            final File toCreate = new File(path);
-            if (toCreate.createNewFile()) {
-                // TODO(b/142807069): should we scan this file after it's been closed?
-                return ParcelFileDescriptor
-                        .open(toCreate,
-                                ParcelFileDescriptor.MODE_WRITE_ONLY
-                                        | ParcelFileDescriptor.MODE_CREATE)
-                        .detachFd();
-            } else {
-                return -OsConstants.EEXIST;
-            }
-        } catch (IOException e) {
-            Log.e(TAG, "I/O Exception while creating file = " + path, e);
-            return -OsConstants.EIO;
-        }
-    }
-
     /**
-     * Creates file with the given {@link path} on behalf of the app with the given {@link uid}.
-     * Checks if the file path is legal for the given app and file type.
+     * Enforces file creation restrictions (see return values) for the given file on behalf of the
+     * app with the given {@code uid}. If the file is is added to the shared storage, creates a
+     * database entry for it.
+     * <p> Does NOT create file.
      *
      * @param path the path of the file
      * @param uid UID of the app requesting to create the file
-     * @return In case of success, file descriptor of the newly created file, open for writing.
-     * If the operation is illegal or not permitted, returns the appropriate negated {@code errno}
-     * value:
+     * @return In case of success, 0. If the operation is illegal or not permitted, returns the
+     * appropriate negated {@code errno} value:
      * <ul>
      * <li>ENOENT if the app tries to create file in other app's external dir
      * <li>EEXIST if the file already exists
@@ -4626,23 +4795,16 @@ public class MediaProvider extends ContentProvider {
      * Called from JNI in jni/MediaProviderWrapper.cpp
      */
     @Keep
-    public int createFile(@NonNull String path, int uid) {
+    public int insertFileIfNecessary(@NonNull String path, int uid) {
         final LocalCallingIdentity token =
                 clearLocalCallingIdentity(LocalCallingIdentity.fromExternal(getContext(), uid));
         try {
             // Returns null if the path doesn't correspond to an app specific directory
             final String appSpecificDir = extractPathOwnerPackageName(path);
 
+            // App dirs are not indexed, so we don't create an entry for the file.
             if (appSpecificDir != null) {
-                for (String packageName : mCallingIdentity.get().getSharedPackageNames()) {
-                    if (appSpecificDir.toLowerCase().equals(packageName.toLowerCase())) {
-                        return createFileInAppSpecificDir(path);
-                    }
-                }
-                Log.e(TAG, "Cannot create file under other app's external directory!");
-                // We treat this error as if the directory doesn't exist to make it harder for
-                // apps to snoop around whether other apps exist or not.
-                return -OsConstants.ENOENT;
+                return checkAppSpecificDirAccess(appSpecificDir);
             }
 
             final String mimeType = MediaFile.getMimeTypeForFile(path);
@@ -4655,7 +4817,6 @@ public class MediaProvider extends ContentProvider {
             final String callingPackageName = getCallingPackageOrSelf();
             final String relativePath = extractRelativePath(path);
 
-            // TODO(b/142850883): Use IS_PENDING.
             ContentValues values = new ContentValues();
             values.put(FileColumns.RELATIVE_PATH, relativePath);
             values.put(FileColumns.DISPLAY_NAME, displayName);
@@ -4666,19 +4827,10 @@ public class MediaProvider extends ContentProvider {
             if (item == null) {
                 return -OsConstants.EPERM;
             }
-            // File has been created and inserted into the database, now we need to open it and
-            // return the FD to the caller
-            ParcelFileDescriptor pfd = openFile(item, "w");
-            if (pfd == null) {
-                return -OsConstants.EIO;
-            }
-            return pfd.detachFd();
+            return 0;
         } catch (IllegalArgumentException e) {
-            Log.e(TAG, "createFile failed", e);
+            Log.e(TAG, "insertFileIfNecessary failed", e);
             return -OsConstants.EPERM;
-        } catch (FileNotFoundException ignored) {
-            // Can't happen since we don't get to #openFile unless #insert succeeds
-            return -OsConstants.EIO;
         } finally {
             restoreLocalCallingIdentity(token);
         }
@@ -4694,7 +4846,7 @@ public class MediaProvider extends ContentProvider {
     }
 
     /**
-     * Deletes file with the given {@link path} on behalf of the app with the given {@link uid}.
+     * Deletes file with the given {@code path} on behalf of the app with the given {@code uid}.
      * <p>Before deleting, checks if app has permissions to delete this file.
      *
      * @param path the path of the file
@@ -4704,7 +4856,7 @@ public class MediaProvider extends ContentProvider {
      * <ul>
      * <li>ENOENT if the file does not exist or if the app tries to delete file in another app's
      * external dir
-     * <li>EPERM a security exception was thrown by {@link delete}
+     * <li>EPERM a security exception was thrown by {@link #delete}
      * </ul>
      *
      * Called from JNI in jni/MediaProviderWrapper.cpp
@@ -4719,15 +4871,12 @@ public class MediaProvider extends ContentProvider {
 
             // Trying to create file under some app's external storage dir
             if (appSpecificDir != null) {
-                for (String packageName : mCallingIdentity.get().getSharedPackageNames()) {
-                    if (appSpecificDir.toLowerCase().equals(packageName.toLowerCase())) {
-                        return deleteFileInAppSpecificDir(path);
-                    }
+                int negErrno = checkAppSpecificDirAccess(appSpecificDir);
+                if (negErrno == 0) {
+                    return deleteFileInAppSpecificDir(path);
+                } else {
+                    return negErrno;
                 }
-                Log.e(TAG, "Cannot delete files from other app's specific directory!");
-                // We treat this error as if the directory doesn't exist to make it harder for
-                // apps to snoop around whether other apps exist or not.
-                return -OsConstants.ENOENT;
             }
 
             final String mimeType = MediaFile.getMimeTypeForFile(path);
@@ -5221,11 +5370,9 @@ public class MediaProvider extends ContentProvider {
     private static final int DOWNLOADS = 800;
     private static final int DOWNLOADS_ID = 801;
 
-    private static final UriMatcher HIDDEN_URI_MATCHER =
-            new UriMatcher(UriMatcher.NO_MATCH);
-
-    private static final UriMatcher PUBLIC_URI_MATCHER =
-            new UriMatcher(UriMatcher.NO_MATCH);
+    /** Flag if we're running as {@link MediaStore#AUTHORITY_LEGACY} */
+    private boolean mLegacyProvider;
+    private LocalUriMatcher mUriMatcher;
 
     private static final String[] PATH_PROJECTION = new String[] {
         MediaStore.MediaColumns._ID,
@@ -5237,91 +5384,97 @@ public class MediaProvider extends ContentProvider {
         + " WHERE " + Audio.Playlists.Members.PLAYLIST_ID + "=?"
         + " ORDER BY " + Audio.Playlists.Members.PLAY_ORDER;
 
-    private static int matchUri(Uri uri, boolean allowHidden) {
-        final int publicMatch = PUBLIC_URI_MATCHER.match(uri);
-        if (publicMatch != UriMatcher.NO_MATCH) {
-            return publicMatch;
-        }
-
-        final int hiddenMatch = HIDDEN_URI_MATCHER.match(uri);
-        if (hiddenMatch != UriMatcher.NO_MATCH) {
-            // Detect callers asking about hidden behavior by looking closer when
-            // the matchers diverge; we only care about apps that are explicitly
-            // targeting a specific public API level.
-            if (!allowHidden) {
-                throw new IllegalStateException("Unknown URL: " + uri + " is hidden API");
-            }
-            return hiddenMatch;
-        }
-
-        return UriMatcher.NO_MATCH;
+    private int matchUri(Uri uri, boolean allowHidden) {
+        return mUriMatcher.matchUri(uri, allowHidden);
     }
 
-    static {
-        final UriMatcher publicMatcher = PUBLIC_URI_MATCHER;
-        final UriMatcher hiddenMatcher = HIDDEN_URI_MATCHER;
+    static class LocalUriMatcher {
+        private final UriMatcher mPublic = new UriMatcher(UriMatcher.NO_MATCH);
+        private final UriMatcher mHidden = new UriMatcher(UriMatcher.NO_MATCH);
 
-        publicMatcher.addURI(AUTHORITY, "*/images/media", IMAGES_MEDIA);
-        publicMatcher.addURI(AUTHORITY, "*/images/media/#", IMAGES_MEDIA_ID);
-        publicMatcher.addURI(AUTHORITY, "*/images/media/#/thumbnail", IMAGES_MEDIA_ID_THUMBNAIL);
-        publicMatcher.addURI(AUTHORITY, "*/images/thumbnails", IMAGES_THUMBNAILS);
-        publicMatcher.addURI(AUTHORITY, "*/images/thumbnails/#", IMAGES_THUMBNAILS_ID);
+        public int matchUri(Uri uri, boolean allowHidden) {
+            final int publicMatch = mPublic.match(uri);
+            if (publicMatch != UriMatcher.NO_MATCH) {
+                return publicMatch;
+            }
 
-        publicMatcher.addURI(AUTHORITY, "*/audio/media", AUDIO_MEDIA);
-        publicMatcher.addURI(AUTHORITY, "*/audio/media/#", AUDIO_MEDIA_ID);
-        publicMatcher.addURI(AUTHORITY, "*/audio/media/#/genres", AUDIO_MEDIA_ID_GENRES);
-        publicMatcher.addURI(AUTHORITY, "*/audio/media/#/genres/#", AUDIO_MEDIA_ID_GENRES_ID);
-        hiddenMatcher.addURI(AUTHORITY, "*/audio/media/#/playlists", AUDIO_MEDIA_ID_PLAYLISTS);
-        hiddenMatcher.addURI(AUTHORITY, "*/audio/media/#/playlists/#", AUDIO_MEDIA_ID_PLAYLISTS_ID);
-        publicMatcher.addURI(AUTHORITY, "*/audio/genres", AUDIO_GENRES);
-        publicMatcher.addURI(AUTHORITY, "*/audio/genres/#", AUDIO_GENRES_ID);
-        publicMatcher.addURI(AUTHORITY, "*/audio/genres/#/members", AUDIO_GENRES_ID_MEMBERS);
-        // TODO: not actually defined in API, but CTS tested
-        publicMatcher.addURI(AUTHORITY, "*/audio/genres/all/members", AUDIO_GENRES_ALL_MEMBERS);
-        publicMatcher.addURI(AUTHORITY, "*/audio/playlists", AUDIO_PLAYLISTS);
-        publicMatcher.addURI(AUTHORITY, "*/audio/playlists/#", AUDIO_PLAYLISTS_ID);
-        publicMatcher.addURI(AUTHORITY, "*/audio/playlists/#/members", AUDIO_PLAYLISTS_ID_MEMBERS);
-        publicMatcher.addURI(AUTHORITY, "*/audio/playlists/#/members/#", AUDIO_PLAYLISTS_ID_MEMBERS_ID);
-        publicMatcher.addURI(AUTHORITY, "*/audio/artists", AUDIO_ARTISTS);
-        publicMatcher.addURI(AUTHORITY, "*/audio/artists/#", AUDIO_ARTISTS_ID);
-        publicMatcher.addURI(AUTHORITY, "*/audio/artists/#/albums", AUDIO_ARTISTS_ID_ALBUMS);
-        publicMatcher.addURI(AUTHORITY, "*/audio/albums", AUDIO_ALBUMS);
-        publicMatcher.addURI(AUTHORITY, "*/audio/albums/#", AUDIO_ALBUMS_ID);
-        // TODO: not actually defined in API, but CTS tested
-        publicMatcher.addURI(AUTHORITY, "*/audio/albumart", AUDIO_ALBUMART);
-        // TODO: not actually defined in API, but CTS tested
-        publicMatcher.addURI(AUTHORITY, "*/audio/albumart/#", AUDIO_ALBUMART_ID);
-        // TODO: not actually defined in API, but CTS tested
-        publicMatcher.addURI(AUTHORITY, "*/audio/media/#/albumart", AUDIO_ALBUMART_FILE_ID);
+            final int hiddenMatch = mHidden.match(uri);
+            if (hiddenMatch != UriMatcher.NO_MATCH) {
+                // Detect callers asking about hidden behavior by looking closer when
+                // the matchers diverge; we only care about apps that are explicitly
+                // targeting a specific public API level.
+                if (!allowHidden) {
+                    throw new IllegalStateException("Unknown URL: " + uri + " is hidden API");
+                }
+                return hiddenMatch;
+            }
 
-        publicMatcher.addURI(AUTHORITY, "*/video/media", VIDEO_MEDIA);
-        publicMatcher.addURI(AUTHORITY, "*/video/media/#", VIDEO_MEDIA_ID);
-        publicMatcher.addURI(AUTHORITY, "*/video/media/#/thumbnail", VIDEO_MEDIA_ID_THUMBNAIL);
-        publicMatcher.addURI(AUTHORITY, "*/video/thumbnails", VIDEO_THUMBNAILS);
-        publicMatcher.addURI(AUTHORITY, "*/video/thumbnails/#", VIDEO_THUMBNAILS_ID);
+            return UriMatcher.NO_MATCH;
+        }
 
-        publicMatcher.addURI(AUTHORITY, "*/media_scanner", MEDIA_SCANNER);
+        public LocalUriMatcher(String auth) {
+            mPublic.addURI(auth, "*/images/media", IMAGES_MEDIA);
+            mPublic.addURI(auth, "*/images/media/#", IMAGES_MEDIA_ID);
+            mPublic.addURI(auth, "*/images/media/#/thumbnail", IMAGES_MEDIA_ID_THUMBNAIL);
+            mPublic.addURI(auth, "*/images/thumbnails", IMAGES_THUMBNAILS);
+            mPublic.addURI(auth, "*/images/thumbnails/#", IMAGES_THUMBNAILS_ID);
 
-        // NOTE: technically hidden, since Uri is never exposed
-        publicMatcher.addURI(AUTHORITY, "*/fs_id", FS_ID);
-        // NOTE: technically hidden, since Uri is never exposed
-        publicMatcher.addURI(AUTHORITY, "*/version", VERSION);
+            mPublic.addURI(auth, "*/audio/media", AUDIO_MEDIA);
+            mPublic.addURI(auth, "*/audio/media/#", AUDIO_MEDIA_ID);
+            mPublic.addURI(auth, "*/audio/media/#/genres", AUDIO_MEDIA_ID_GENRES);
+            mPublic.addURI(auth, "*/audio/media/#/genres/#", AUDIO_MEDIA_ID_GENRES_ID);
+            mHidden.addURI(auth, "*/audio/media/#/playlists", AUDIO_MEDIA_ID_PLAYLISTS);
+            mHidden.addURI(auth, "*/audio/media/#/playlists/#", AUDIO_MEDIA_ID_PLAYLISTS_ID);
+            mPublic.addURI(auth, "*/audio/genres", AUDIO_GENRES);
+            mPublic.addURI(auth, "*/audio/genres/#", AUDIO_GENRES_ID);
+            mPublic.addURI(auth, "*/audio/genres/#/members", AUDIO_GENRES_ID_MEMBERS);
+            // TODO: not actually defined in API, but CTS tested
+            mPublic.addURI(auth, "*/audio/genres/all/members", AUDIO_GENRES_ALL_MEMBERS);
+            mPublic.addURI(auth, "*/audio/playlists", AUDIO_PLAYLISTS);
+            mPublic.addURI(auth, "*/audio/playlists/#", AUDIO_PLAYLISTS_ID);
+            mPublic.addURI(auth, "*/audio/playlists/#/members", AUDIO_PLAYLISTS_ID_MEMBERS);
+            mPublic.addURI(auth, "*/audio/playlists/#/members/#", AUDIO_PLAYLISTS_ID_MEMBERS_ID);
+            mPublic.addURI(auth, "*/audio/artists", AUDIO_ARTISTS);
+            mPublic.addURI(auth, "*/audio/artists/#", AUDIO_ARTISTS_ID);
+            mPublic.addURI(auth, "*/audio/artists/#/albums", AUDIO_ARTISTS_ID_ALBUMS);
+            mPublic.addURI(auth, "*/audio/albums", AUDIO_ALBUMS);
+            mPublic.addURI(auth, "*/audio/albums/#", AUDIO_ALBUMS_ID);
+            // TODO: not actually defined in API, but CTS tested
+            mPublic.addURI(auth, "*/audio/albumart", AUDIO_ALBUMART);
+            // TODO: not actually defined in API, but CTS tested
+            mPublic.addURI(auth, "*/audio/albumart/#", AUDIO_ALBUMART_ID);
+            // TODO: not actually defined in API, but CTS tested
+            mPublic.addURI(auth, "*/audio/media/#/albumart", AUDIO_ALBUMART_FILE_ID);
 
-        hiddenMatcher.addURI(AUTHORITY, "*", VOLUMES_ID);
-        hiddenMatcher.addURI(AUTHORITY, null, VOLUMES);
+            mPublic.addURI(auth, "*/video/media", VIDEO_MEDIA);
+            mPublic.addURI(auth, "*/video/media/#", VIDEO_MEDIA_ID);
+            mPublic.addURI(auth, "*/video/media/#/thumbnail", VIDEO_MEDIA_ID_THUMBNAIL);
+            mPublic.addURI(auth, "*/video/thumbnails", VIDEO_THUMBNAILS);
+            mPublic.addURI(auth, "*/video/thumbnails/#", VIDEO_THUMBNAILS_ID);
 
-        // Used by MTP implementation
-        publicMatcher.addURI(AUTHORITY, "*/file", FILES);
-        publicMatcher.addURI(AUTHORITY, "*/file/#", FILES_ID);
-        hiddenMatcher.addURI(AUTHORITY, "*/object", MTP_OBJECTS);
-        hiddenMatcher.addURI(AUTHORITY, "*/object/#", MTP_OBJECTS_ID);
-        hiddenMatcher.addURI(AUTHORITY, "*/object/#/references", MTP_OBJECT_REFERENCES);
+            mPublic.addURI(auth, "*/media_scanner", MEDIA_SCANNER);
 
-        // Used only to trigger special logic for directories
-        hiddenMatcher.addURI(AUTHORITY, "*/dir", FILES_DIRECTORY);
+            // NOTE: technically hidden, since Uri is never exposed
+            mPublic.addURI(auth, "*/fs_id", FS_ID);
+            // NOTE: technically hidden, since Uri is never exposed
+            mPublic.addURI(auth, "*/version", VERSION);
 
-        publicMatcher.addURI(AUTHORITY, "*/downloads", DOWNLOADS);
-        publicMatcher.addURI(AUTHORITY, "*/downloads/#", DOWNLOADS_ID);
+            mHidden.addURI(auth, "*", VOLUMES_ID);
+            mHidden.addURI(auth, null, VOLUMES);
+
+            // Used by MTP implementation
+            mPublic.addURI(auth, "*/file", FILES);
+            mPublic.addURI(auth, "*/file/#", FILES_ID);
+            mHidden.addURI(auth, "*/object", MTP_OBJECTS);
+            mHidden.addURI(auth, "*/object/#", MTP_OBJECTS_ID);
+            mHidden.addURI(auth, "*/object/#/references", MTP_OBJECT_REFERENCES);
+
+            // Used only to trigger special logic for directories
+            mHidden.addURI(auth, "*/dir", FILES_DIRECTORY);
+
+            mPublic.addURI(auth, "*/downloads", DOWNLOADS);
+            mPublic.addURI(auth, "*/downloads/#", DOWNLOADS_ID);
+        }
     }
 
     /**

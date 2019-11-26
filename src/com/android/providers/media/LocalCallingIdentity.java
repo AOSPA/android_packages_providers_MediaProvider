@@ -17,6 +17,9 @@
 package com.android.providers.media;
 
 import static android.Manifest.permission.ACCESS_MEDIA_LOCATION;
+import static android.app.AppOpsManager.MODE_ALLOWED;
+import static android.app.AppOpsManager.permissionToOp;
+import static android.content.pm.PackageManager.PERMISSION_DENIED;
 
 import static com.android.providers.media.util.PermissionUtils.checkPermissionLegacy;
 import static com.android.providers.media.util.PermissionUtils.checkPermissionReadAudio;
@@ -31,7 +34,6 @@ import android.annotation.Nullable;
 import android.app.AppOpsManager;
 import android.content.ContentProvider;
 import android.content.Context;
-import android.content.PermissionChecker;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager.NameNotFoundException;
 import android.os.Binder;
@@ -71,14 +73,19 @@ public class LocalCallingIdentity {
     }
 
     public static LocalCallingIdentity fromExternal(Context context, int uid) {
-        if (uid == 0) {
-            return forAdbdRoot(context);
-        }
         final String[] sharedPackageNames = context.getPackageManager().getPackagesForUid(uid);
         if (sharedPackageNames == null || sharedPackageNames.length == 0) {
             throw new IllegalArgumentException("UID " + uid + " has no associated package");
         }
-        return fromExternal(context, uid, sharedPackageNames[0], null);
+        LocalCallingIdentity ident =  fromExternal(context, uid, sharedPackageNames[0], null);
+        if (uid == Process.SHELL_UID) {
+            // This is useful for debugging/testing/development
+            if (SystemProperties.getBoolean("persist.sys.fuse.shell.redaction-needed", false)) {
+                ident.hasPermission |= PERMISSION_IS_REDACTION_NEEDED;
+                ident.hasPermissionResolved = PERMISSION_IS_REDACTION_NEEDED;
+            }
+        }
+        return ident;
     }
 
     public static LocalCallingIdentity fromExternal(Context context, int uid, String packageName,
@@ -114,23 +121,6 @@ public class LocalCallingIdentity {
             packageNameResolved = true;
         }
         return packageName;
-    }
-
-    private static LocalCallingIdentity forAdbdRoot(Context context) {
-        final LocalCallingIdentity ident = new LocalCallingIdentity(context, 1 /*init pid*/,
-                Process.SHELL_UID, "com.android.shell", null);
-
-        ident.packageName = ident.packageNameUnchecked;
-        ident.packageNameResolved = true;
-        ident.targetSdkVersion = Build.VERSION_CODES.CUR_DEVELOPMENT;
-        ident.targetSdkVersionResolved = true;
-        // Redaction is not needed by default
-        ident.hasPermission = ~(PERMISSION_IS_LEGACY | PERMISSION_IS_REDACTION_NEEDED);
-        if (SystemProperties.getBoolean("persist.sys.fuse.shell-root.redaction-needed", false)) {
-            ident.hasPermission |= PERMISSION_IS_REDACTION_NEEDED;
-        }
-        ident.hasPermissionResolved = ~0;
-        return ident;
     }
 
     private String getPackageNameInternal() {
@@ -235,14 +225,20 @@ public class LocalCallingIdentity {
         return checkPermissionLegacy(context, pid, uid, getPackageName());
     }
 
+    /** System internals or callers holding permission have no redaction */
     private boolean isRedactionNeededInternal() {
-        // System internals or callers holding permission have no redaction
-        if (hasPermission(PERMISSION_IS_SYSTEM) || PermissionChecker.checkPermissionForDataDelivery(
-                context, ACCESS_MEDIA_LOCATION, pid, uid, getPackageName(), null /*message*/)
-                        == PermissionChecker.PERMISSION_GRANTED) {
+        if (hasPermission(PERMISSION_IS_SYSTEM)) {
             return false;
         }
-        return true;
+
+        if (context.checkPermission(ACCESS_MEDIA_LOCATION, pid, uid) == PERMISSION_DENIED
+                || context.getSystemService(AppOpsManager.class).noteProxyOpNoThrow(
+                permissionToOp(ACCESS_MEDIA_LOCATION), getPackageName(), uid, featureId, null)
+                != MODE_ALLOWED) {
+            return true;
+        }
+
+        return false;
     }
 
     private LongArray ownedIds = new LongArray();

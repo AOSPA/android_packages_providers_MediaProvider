@@ -17,12 +17,13 @@
 #include "FuseDaemon.h"
 
 #include <android-base/logging.h>
-#include <android-base/properties.h>
+#include <android/log.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <fuse_i.h>
+#include <fuse_log.h>
 #include <fuse_lowlevel.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -49,6 +50,7 @@
 #include <map>
 #include <queue>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "MediaProviderWrapper.h"
@@ -65,11 +67,10 @@ using std::vector;
 #define FUSE_UNKNOWN_INO 0xffffffff
 
 constexpr size_t MAX_READ_SIZE = 128 * 1024;
-static constexpr const char* kPropRedactionEnabled = "persist.sys.fuse.redaction-enabled";
 
 class handle {
   public:
-    handle(const string& path) : path(path), fd(-1), ri(){};
+    handle(const string& path) : path(path), fd(-1), ri(nullptr){};
     string path;
     int fd;
     std::unique_ptr<RedactionInfo> ri;
@@ -453,6 +454,10 @@ static struct node* make_node_entry(fuse_req_t req,
     pthread_mutex_unlock(&fuse->lock);
 
     return node;
+}
+
+static inline bool is_requesting_write(int flags) {
+    return flags & (O_WRONLY | O_RDWR);
 }
 
 namespace mediaprovider {
@@ -875,15 +880,20 @@ static void pf_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi) {
         fuse_reply_err(req, ENOMEM);
         return;
     }
+
+    if (fi->flags & O_DIRECT) {
+        fi->flags &= ~O_DIRECT;
+        fi->direct_io = true;
+    }
+
     TRACE_FUSE(fuse) << "OPEN " << path;
-    h->fd = open(path.c_str(), fi->flags);
-    if (h->fd < 0) {
+    errno = -fuse->mp->IsOpenAllowed(h->path, ctx->uid, is_requesting_write(fi->flags));
+    if (errno || (h->fd = open(path.c_str(), fi->flags)) < 0) {
         delete h;
         fuse_reply_err(req, errno);
         return;
     }
-    // Initialize ri as nullptr to know that redaction info has not been checked yet.
-    h->ri = nullptr;
+
     fi->fh = ptr_to_id(h);
     fi->keep_cache = 1;
     fuse_reply_open(req, fi);
@@ -996,13 +1006,8 @@ static void pf_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
     struct fuse* fuse = get_fuse(req);
     TRACE_FUSE(fuse) << "READ";
     if (!h->ri) {
-        if (android::base::GetBoolProperty(kPropRedactionEnabled, true)) {
-            h->ri = fuse->mp->GetRedactionInfo(h->path, req->ctx.uid);
-        } else {
-            // If redaction is not enabled, we just use empty redaction ranges
-            // which mean that we will always use do_read instead of do_read_with_redaction
-            h->ri = std::make_unique<RedactionInfo>();
-        }
+        h->ri = fuse->mp->GetRedactionInfo(h->path, req->ctx.uid);
+
         if (!h->ri) {
             errno = EIO;
             fuse_reply_err(req, errno);
@@ -1094,9 +1099,14 @@ static void pf_release(fuse_req_t req,
     struct fuse* fuse = get_fuse(req);
     handle* h = reinterpret_cast<handle*>(fi->fh);
 
-    TRACE_FUSE(fuse) << "RELEASE " << h << "(" << h->fd << ")";
+    TRACE_FUSE(fuse) << "RELEASE "
+                     << "0" << std::oct << fi->flags << " " << h << "(" << h->fd << ")";
+
     fuse->fadviser.Close(h->fd);
     close(h->fd);
+    if (is_requesting_write(fi->flags)) {
+        fuse->mp->ScanFile(h->path);
+    }
     delete h;
     fuse_reply_err(req, 0);
 }
@@ -1307,8 +1317,8 @@ static void pf_create(fuse_req_t req,
     pthread_mutex_lock(&fuse->lock);
     parent_node = lookup_node_by_id_locked(fuse, parent);
     parent_path = get_node_path_locked(parent_node);
-    TRACE_FUSE(fuse) << "CREATE " << name << " 0" << std::oct << mode << " @ " << parent << " ("
-                     << safe_name(parent_node) << ")";
+    TRACE_FUSE(fuse) << "CREATE " << name << " 0" << std::oct << fi->flags << " @ " << parent
+                     << " (" << safe_name(parent_node) << ")";
     pthread_mutex_unlock(&fuse->lock);
 
     child_path = parent_path + "/" + name;
@@ -1319,11 +1329,15 @@ static void pf_create(fuse_req_t req,
         return;
     }
     mode = (mode & (~0777)) | 0664;
-    // TODO(b/142863102): implement mechanism to pass fi->flags to MediaProvider
-    // and use them when opening the file on the app's behalf.
-    h->fd = fuse->mp->CreateFile(child_path.c_str(), ctx->uid);
-    if (h->fd < 0) {
-        errno = -h->fd;
+    int mp_return_code = fuse->mp->InsertFile(child_path.c_str(), ctx->uid);
+    if (mp_return_code || ((h->fd = open(child_path.c_str(), fi->flags, mode)) < 0)) {
+        if (mp_return_code) {
+            errno = -mp_return_code;
+            // In this case, we know open was not called.
+        } else {
+            // In this case, we know that open has failed, so we want to undo the file insertion.
+            fuse->mp->DeleteFile(child_path.c_str(), ctx->uid);
+        }
         delete h;
         PLOG(DEBUG) << "Could not create file: " << child_path;
         fuse_reply_err(req, errno);
@@ -1393,20 +1407,19 @@ static void pf_fallocate(fuse_req_t req, fuse_ino_t ino, int mode,
 static struct fuse_lowlevel_ops ops{
     .init = pf_init,
     /*.destroy = pf_destroy,*/
-    .lookup = pf_lookup, .forget = pf_forget, .forget_multi = pf_forget_multi,
-    .getattr = pf_getattr, .setattr = pf_setattr,
+    .lookup = pf_lookup, .forget = pf_forget, .getattr = pf_getattr,
+    .setattr = pf_setattr,
     /*.readlink = pf_readlink,*/
-    .mknod = pf_mknod, .mkdir = pf_mkdir, .unlink = pf_unlink, .rmdir = pf_rmdir,
+    .mknod = pf_mknod, .mkdir = pf_mkdir, .unlink = pf_unlink,
+    .rmdir = pf_rmdir,
     /*.symlink = pf_symlink,*/
     .rename = pf_rename,
     /*.link = pf_link,*/
     .open = pf_open, .read = pf_read,
     /*.write = pf_write,*/
-    .write_buf = pf_write_buf,
-    /*.copy_file_range = pf_copy_file_range,*/
-    .flush = pf_flush, .release = pf_release, .fsync = pf_fsync, .fsyncdir = pf_fsyncdir,
-    .opendir = pf_opendir, .readdir = pf_readdir, .readdirplus = pf_readdirplus,
-    .releasedir = pf_releasedir, .statfs = pf_statfs,
+    .flush = pf_flush, .release = pf_release, .fsync = pf_fsync,
+    .opendir = pf_opendir, .readdir = pf_readdir, .releasedir = pf_releasedir,
+    .fsyncdir = pf_fsyncdir, .statfs = pf_statfs,
     /*.setxattr = pf_setxattr,
     .getxattr = pf_getxattr,
     .listxattr = pf_listxattr,
@@ -1416,10 +1429,14 @@ static struct fuse_lowlevel_ops ops{
     .setlk = pf_setlk,
     .bmap = pf_bmap,
     .ioctl = pf_ioctl,
-    .poll = pf_poll,
-    .retrieve_reply = pf_retrieve_reply,*/
+    .poll = pf_poll,*/
+    .write_buf = pf_write_buf,
+    /*.retrieve_reply = pf_retrieve_reply,*/
+    .forget_multi = pf_forget_multi,
     /*.flock = pf_flock,
     .fallocate = pf_fallocate,*/
+    .readdirplus = pf_readdirplus,
+    /*.copy_file_range = pf_copy_file_range,*/
 };
 
 static struct fuse_loop_config config = {
@@ -1427,9 +1444,13 @@ static struct fuse_loop_config config = {
         .max_idle_threads = 10,
 };
 
-FuseDaemon::FuseDaemon(JNIEnv* env, jobject mediaProvider) : mp(env, mediaProvider) {}
+static std::unordered_map<enum fuse_log_level, enum android_LogPriority> fuse_to_android_loglevel;
 
-void FuseDaemon::Stop() {}
+static void fuse_logger(enum fuse_log_level level, const char* fmt, va_list ap) {
+    __android_log_vprint(fuse_to_android_loglevel.at(level), LOG_TAG, fmt, ap);
+}
+
+FuseDaemon::FuseDaemon(JNIEnv* env, jobject mediaProvider) : mp(env, mediaProvider) {}
 
 void FuseDaemon::Start(const int fd, const std::string& path) {
     struct fuse_args args;
@@ -1477,22 +1498,40 @@ void FuseDaemon::Start(const int fd, const std::string& path) {
 
     umask(0);
 
-    LOG(INFO) << "Starting fuse...";
+    // Custom logging for libfuse
+    fuse_to_android_loglevel.insert({FUSE_LOG_EMERG, ANDROID_LOG_FATAL});
+    fuse_to_android_loglevel.insert({FUSE_LOG_ALERT, ANDROID_LOG_ERROR});
+    fuse_to_android_loglevel.insert({FUSE_LOG_CRIT, ANDROID_LOG_ERROR});
+    fuse_to_android_loglevel.insert({FUSE_LOG_WARNING, ANDROID_LOG_WARN});
+    fuse_to_android_loglevel.insert({FUSE_LOG_NOTICE, ANDROID_LOG_INFO});
+    fuse_to_android_loglevel.insert({FUSE_LOG_INFO, ANDROID_LOG_DEBUG});
+    fuse_to_android_loglevel.insert({FUSE_LOG_DEBUG, ANDROID_LOG_VERBOSE});
+    fuse_set_log_func(fuse_logger);
+
     struct fuse_session
             * se = fuse_session_new(&args, &ops, sizeof(ops), &fuse_default);
+    if (!se) {
+        PLOG(ERROR) << "Failed to create session ";
+        return;
+    }
     se->fd = fd;
     se->mountpoint = strdup(path.c_str());
 
     // Single thread. Useful for debugging
     // fuse_session_loop(se);
     // Multi-threaded
+    LOG(INFO) << "Starting fuse...";
     fuse_session_loop_mt(se, &config);
+    LOG(INFO) << "Ending fuse...";
 
     if (munmap(fuse_default.zero_addr, MAX_READ_SIZE)) {
         PLOG(ERROR) << "munmap failed!";
     }
 
-    LOG(INFO) << "Ending fuse...";
+    fuse_opt_free_args(&args);
+    fuse_session_destroy(se);
+    LOG(INFO) << "Ended fuse";
+    return;
 }
 } //namespace fuse
 }  // namespace mediaprovider
