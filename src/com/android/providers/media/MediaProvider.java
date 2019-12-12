@@ -93,6 +93,7 @@ import android.os.ParcelFileDescriptor.OnCloseListener;
 import android.os.RedactingFileDescriptor;
 import android.os.RemoteException;
 import android.os.SystemClock;
+import android.os.SystemProperties;
 import android.os.Trace;
 import android.os.UserHandle;
 import android.os.UserManager;
@@ -192,7 +193,7 @@ public class MediaProvider extends ContentProvider {
      * and which captures the package name as the first group.
      */
     static final Pattern PATTERN_OWNED_PATH = Pattern.compile(
-            "(?i)^/storage/[^/]+/(?:[0-9]+/)?Android/(?:data|media|obb|sandbox)/([^/]+)/.*");
+            "(?i)^/storage/[^/]+/(?:[0-9]+/)?Android/(?:data|media|obb|sandbox)/([^/]+)(/.*)?");
 
     /**
      * Regex that matches paths for {@link MediaColumns#RELATIVE_PATH}; it
@@ -212,6 +213,11 @@ public class MediaProvider extends ContentProvider {
      */
     static final Pattern PATTERN_SELECTION_ID = Pattern.compile(
             "(?:image_id|video_id)\\s*=\\s*(\\d+)");
+
+    /**
+     * Property that indicates whether fuse is enabled.
+     */
+    private static final String PROP_FUSE = "persist.sys.fuse";
 
     /**
      * These directory names aren't declared in Environment as final variables, and so we need to
@@ -279,13 +285,7 @@ public class MediaProvider extends ContentProvider {
     }
 
     public static File getVolumePath(String volumeName) throws FileNotFoundException {
-        // TODO(b/144275217): A more performant invocation is
-        // MediaStore#getVolumePath(sCachedVolumes, volumeName) since we avoid a binder
-        // to StorageManagerService to getVolumeList. We need to delay the mount broadcasts
-        // from StorageManagerService so that sCachedVolumes is up to date in
-        // onVolumeStateChanged before we to call this method, otherwise we would crash
-        // when we don't find volumeName yet
-        return MediaStore.getVolumePath(volumeName);
+        return MediaStore.getVolumePath(sCachedVolumes, volumeName);
     }
 
     public static Set<String> getExternalVolumeNames() {
@@ -965,6 +965,102 @@ public class MediaProvider extends ContentProvider {
             return newUri;
         }
         return uri;
+    }
+
+    private ArraySet<String> getDirectories(Bundle queryArgs, Uri uri, String[] projection,
+                                            String path) {
+        ArraySet<String> directoryEntrySet = new ArraySet<>();
+        try (final Cursor cursor = query(uri, projection, queryArgs, null)) {
+            while(cursor.moveToNext()) {
+                // Obtain directories with media/non-media files in the given directory.
+                // Get media/non-media files from child directories of the given directory and
+                // extract child directory name from media/non-media file.
+                String directoryName = cursor.getString(cursor.getColumnIndex(
+                    MediaStore.MediaColumns.RELATIVE_PATH)).
+                    replaceAll("^" + path + "/?([^/]+)/.*", "$1");
+                directoryEntrySet.add(directoryName);
+            }
+        }
+        return directoryEntrySet;
+    }
+
+    private ArrayList<String> getFiles(Bundle queryArgs, Uri uri, String[] projection,
+                                       String path) {
+        ArrayList<String> directoryEntryList = new ArrayList<>();
+        try (final Cursor cursor = query(uri, projection, queryArgs, null)) {
+            while(cursor.moveToNext()) {
+                // Use display name for both Media & Non Media Files
+                directoryEntryList.add(cursor.getString(cursor.getColumnIndex(
+                        MediaStore.MediaColumns.DISPLAY_NAME)));
+            }
+        }
+        return directoryEntryList;
+    }
+
+    /**
+     * Gets directory entries of a directory path from media provider database.
+     *
+     * @param path path of the directory
+     * @param uid UID of the calling process
+     * @return directory entries, a list of directory entry names in the given directory path.
+     * First part of the list contains regular files, and second part contains directories. "" is
+     * used to separate the first part of this list with the second. An example return string[] is
+     * ["FileName1", "FileName2", ..., "", "DirectoryName1", "DirectoryName2", ...]
+     * An empty list is returned if directory path is unknown to MediaProvider or no directory
+     * entries are visible to the calling app or the given directory is empty.
+     *
+     * Called from JNI in jni/MediaProviderWrapper.cpp
+     */
+    @Keep
+    public String[] getDirectoryEntries(String path, int uid) {
+        final LocalCallingIdentity token = clearLocalCallingIdentity(
+                LocalCallingIdentity.fromExternal(getContext(), uid));
+        String[] directoryEntries = {};
+        try {
+            // Modify the path to match the relative path format
+            // TODO:(b/142806973) This code assumes path always has a leading '/', Remove this code
+            // when relative path extraction is done in MediaProvider.
+            path = path.substring(1);
+            // Escape '(' & ')'to avoid regex conflicts
+            path = path.replace("(","\\(").replace(")", "\\)");
+
+            Bundle queryArgs = new Bundle();
+
+            // Get file names in the given directory. Get file entries from MediaProvider database
+            // with MediaColumns.RELATIVE_PATH as the given path.
+            String[] projection = {MediaStore.MediaColumns.DISPLAY_NAME};
+            String selection = MediaStore.MediaColumns.RELATIVE_PATH +
+                    " REGEXP '^" + path + "/?' and mime_type not like 'null'";
+            queryArgs.putString(ContentResolver.QUERY_ARG_SQL_SELECTION, selection);
+            // TODO:(b/142806973) Extract URI/Volume name from the path
+            ArrayList<String> directoryEntryList = getFiles(queryArgs,
+                    MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL),
+                    projection, path);
+            directoryEntryList.add("");
+
+            // Get directories in the given directory by querying MediaProvider database. Get file
+            // entries with MediaColumns.RELATIVE_PATH same as one of the subdirectories of the
+            // given directory. Extract directory names from the returned RELATIVE_PATH.
+            // Subdirectories can have multiple files, avoid duplicates in query results by
+            // grouping results by MediaColumns.RELATIVE_PATH.
+            // TODO:(b/144350275) readdir() should list empty directories.
+            projection[0] = MediaStore.MediaColumns.RELATIVE_PATH;
+            String groupBy = MediaStore.MediaColumns.RELATIVE_PATH;
+            selection =  MediaStore.MediaColumns.RELATIVE_PATH +
+                    " REGEXP '^" + path + "/?([^/]+/)([^/]+/)*$' and mime_type not like 'null'";
+            queryArgs.putString(ContentResolver.QUERY_ARG_SQL_SELECTION, selection);
+            queryArgs.putString(ContentResolver.QUERY_ARG_SQL_GROUP_BY, groupBy);
+            // TODO:(b/142806973) Extract URI/Volume name from the path
+            directoryEntryList.addAll(getDirectories(queryArgs,
+                      MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL),
+                      projection, path));
+
+            directoryEntries = directoryEntryList.toArray(
+                    new String[directoryEntryList.size()]);
+        } finally {
+            restoreLocalCallingIdentity(token);
+        }
+        return directoryEntries;
     }
 
     @Override
@@ -4354,6 +4450,9 @@ public class MediaProvider extends ContentProvider {
     /**
      * Replacement for {@link #openFileHelper(Uri, String)} which enforces any
      * permissions applicable to the path before returning.
+     *
+     * <p>This function should never be called from the fuse thread since it tries to open
+     * a "/mnt/user" path.
      */
     private ParcelFileDescriptor openFileAndEnforcePathPermissionsHelper(Uri uri, int match,
             String mode, CancellationSignal signal) throws FileNotFoundException {
@@ -4437,12 +4536,22 @@ public class MediaProvider extends ContentProvider {
             // First, handle any redaction that is needed for caller
             final ParcelFileDescriptor pfd;
             if (redactionInfo.redactionRanges.length > 0) {
-                pfd = RedactingFileDescriptor.open(
-                        getContext(),
-                        file,
-                        modeBits,
-                        redactionInfo.redactionRanges,
-                        redactionInfo.freeOffsets);
+                if (SystemProperties.getBoolean(PROP_FUSE, false)) {
+                    // If fuse is enabled, we can provide an fd that points to the fuse
+                    // file system and handle redaction in the fuse handler when the caller reads.
+                    File fuseFile = new File(file.getPath().replaceFirst("/storage/",
+                            "/mnt/user/" + UserHandle.myUserId() + "/"));
+                    pfd = ParcelFileDescriptor.open(fuseFile, modeBits);
+                } else {
+                    // TODO(b/135341978): Remove this and associated code
+                    // when fuse is on by default.
+                    pfd = RedactingFileDescriptor.open(
+                            getContext(),
+                            file,
+                            modeBits,
+                            redactionInfo.redactionRanges,
+                            redactionInfo.freeOffsets);
+                }
             } else {
                 pfd = ParcelFileDescriptor.open(file, modeBits);
             }
@@ -4630,6 +4739,8 @@ public class MediaProvider extends ContentProvider {
                 final XmpInterface isoXmp = XmpInterface.fromContainer(iso, redactedXmpTags);
                 res.addAll(isoXmp.getRedactionRanges());
             }
+        } catch (FileNotFoundException ignored) {
+            // If file not found, then there's nothing to redact
         } catch (IOException e) {
             throw new IOException("Failed to redact " + file, e);
         }
@@ -4659,8 +4770,14 @@ public class MediaProvider extends ContentProvider {
             final String appSpecificDir = extractPathOwnerPackageName(path);
 
             if (appSpecificDir != null) {
-                return checkAppSpecificDirAccess(appSpecificDir);
+                if (isCallingIdentitySharedPackageName(appSpecificDir)) {
+                    return 0;
+                } else {
+                    Log.e(TAG, "Can't open a file in another app's external directory!");
+                    return -OsConstants.ENOENT;
+                }
             }
+
             final String mimeType = MediaFile.getMimeTypeForFile(path);
             final Uri contentUri = getContentUriForFile(path, mimeType);
             final String[] projection = new String[]{
@@ -4700,21 +4817,19 @@ public class MediaProvider extends ContentProvider {
     }
 
     /**
-     * Returns 0 if access is allowed, -ENOENT otherwise.
+     * Returns {@code true} if {@link #mCallingIdentity#getSharedPackages(String)} contains the
+     * given package name, {@code false} otherwise.
      * <p> Assumes that {@code mCallingIdentity} has been properly set to reflect the calling
      * package.
      */
-    private int checkAppSpecificDirAccess(String appSpecificDir) {
-        for (String packageName : mCallingIdentity.get().getSharedPackageNames()) {
-            if (appSpecificDir.toLowerCase(Locale.ROOT)
-                    .equals(packageName.toLowerCase(Locale.ROOT))) {
-                return 0;
+    private boolean isCallingIdentitySharedPackageName(@NonNull String packageName) {
+        for (String sharedPkgName : mCallingIdentity.get().getSharedPackageNames()) {
+            if (packageName.toLowerCase(Locale.ROOT)
+                    .equals(sharedPkgName.toLowerCase(Locale.ROOT))) {
+                return true;
             }
         }
-        Log.e(TAG, "Cannot access file under another app's external directory!");
-        // We treat this error as if the directory doesn't exist to make it harder for
-        // apps to snoop around whether other apps exist or not.
-        return -OsConstants.ENOENT;
+        return false;
     }
 
     /**
@@ -4795,10 +4910,10 @@ public class MediaProvider extends ContentProvider {
      * @return In case of success, 0. If the operation is illegal or not permitted, returns the
      * appropriate negated {@code errno} value:
      * <ul>
-     * <li>ENOENT if the app tries to create file in other app's external dir
-     * <li>EEXIST if the file already exists
-     * <li>EPERM if the file type doesn't match the relative path
-     * <li>EIO in case of any other I/O exception
+     * <li>{@link OsConstants#ENOENT} if the app tries to create file in other app's external dir
+     * <li>{@link OsConstants#EEXIST} if the file already exists
+     * <li>{@link OsConstants#EPERM} if the file type doesn't match the relative path
+     * <li>{@link OsConstants#EIO} in case of any other I/O exception
      * </ul>
      *
      * @throws IllegalStateException if given path is invalid.
@@ -4815,7 +4930,12 @@ public class MediaProvider extends ContentProvider {
 
             // App dirs are not indexed, so we don't create an entry for the file.
             if (appSpecificDir != null) {
-                return checkAppSpecificDirAccess(appSpecificDir);
+                if (isCallingIdentitySharedPackageName(appSpecificDir)) {
+                    return 0;
+                } else {
+                    Log.e(TAG, "Can't create a file in another app's external directory");
+                    return -OsConstants.ENOENT;
+                }
             }
 
             final String mimeType = MediaFile.getMimeTypeForFile(path);
@@ -4865,9 +4985,9 @@ public class MediaProvider extends ContentProvider {
      * @return 0 upon success.
      * In case of error, return the appropriate negated {@code errno} value:
      * <ul>
-     * <li>ENOENT if the file does not exist or if the app tries to delete file in another app's
-     * external dir
-     * <li>EPERM a security exception was thrown by {@link #delete}
+     * <li>{@link OsConstants#ENOENT} if the file does not exist or if the app tries to delete file in another
+     * app's external dir
+     * <li>{@link OsConstants#EPERM} a security exception was thrown by {@link #delete}
      * </ul>
      *
      * Called from JNI in jni/MediaProviderWrapper.cpp
@@ -4882,11 +5002,11 @@ public class MediaProvider extends ContentProvider {
 
             // Trying to create file under some app's external storage dir
             if (appSpecificDir != null) {
-                int negErrno = checkAppSpecificDirAccess(appSpecificDir);
-                if (negErrno == 0) {
+                if (isCallingIdentitySharedPackageName(appSpecificDir)) {
                     return deleteFileInAppSpecificDir(path);
                 } else {
-                    return negErrno;
+                    Log.e(TAG, "Can't delete a file in another app's external directory!");
+                    return -OsConstants.ENOENT;
                 }
             }
 
@@ -4905,6 +5025,82 @@ public class MediaProvider extends ContentProvider {
         } catch (SecurityException e) {
             Log.e(TAG, "File deletion not allowed", e);
             return -OsConstants.EPERM;
+        } finally {
+            restoreLocalCallingIdentity(token);
+        }
+    }
+
+    /**
+     * Checks if the app with the given UID is allowed to create or delete the directory with the
+     * given path.
+     *
+     * @param path File path of the directory that the app wants to create/delete
+     * @param uid UID of the app that wants to create/delete the directory
+     * @return 0 if the operation is allowed, or the following negated {@code errno} values:
+     * <ul>
+     * <li>{@link OsConstants#EACCES} if the app tries to create/delete a dir in another app's
+     * external directory.
+     * <li>{@link OsConstants#EPERM} if the app tries to create/delete a top-level directory.
+     * </ul>
+     *
+     * Called from JNI in jni/MediaProviderWrapper.cpp
+     */
+    @Keep
+    public int isDirectoryOperationAllowed(@NonNull String path, int uid) {
+        final LocalCallingIdentity token =
+                clearLocalCallingIdentity(LocalCallingIdentity.fromExternal(getContext(), uid));
+        try {
+            // Returns null if the path doesn't correspond to an app specific directory
+            final String appSpecificDir = extractPathOwnerPackageName(path);
+
+            // App dirs are not indexed, so we don't create an entry for the file.
+            if (appSpecificDir != null) {
+                if (isCallingIdentitySharedPackageName(appSpecificDir)) {
+                    return 0;
+                } else {
+                    Log.e(TAG, "Can't modify another app's external directory!");
+                    return -OsConstants.EACCES;
+                }
+            }
+
+            final String[] relativePath = sanitizePath(extractRelativePath(path));
+            if (relativePath.length == 1 && TextUtils.isEmpty(relativePath[0])) {
+                Log.e(TAG, "Creating or deleting a top level directory is not allowed!");
+                return -OsConstants.EPERM;
+            }
+            return 0;
+        } finally {
+            restoreLocalCallingIdentity(token);
+        }
+    }
+
+    /**
+     * Checks whether the app with the given UID is allowed to open the directory denoted by the
+     * given path.
+     *
+     * @param path directory's path
+     * @param uid UID of the requesting app
+     * @return 0 if it's allowed to open the diretory, -{@link OsConstants#ENOENT}  otherwise.
+     *
+     * Called from JNI in jni/MediaProviderWrapper.cpp
+     */
+    @Keep
+    public int isOpendirAllowed(@NonNull String path, int uid) {
+        final LocalCallingIdentity token =
+                clearLocalCallingIdentity(LocalCallingIdentity.fromExternal(getContext(), uid));
+        try {
+            // Returns null if the path doesn't correspond to an app specific directory
+            final String appSpecificDir = extractPathOwnerPackageName(path);
+
+            if (appSpecificDir != null) {
+                if (isCallingIdentitySharedPackageName(appSpecificDir)) {
+                    return 0;
+                } else {
+                    Log.e(TAG, "Can't access another app's external directory!");
+                    return -OsConstants.ENOENT;
+                }
+            }
+            return 0;
         } finally {
             restoreLocalCallingIdentity(token);
         }

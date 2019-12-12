@@ -77,10 +77,13 @@ public class FilePathAccessTest {
     static final byte[] BYTES_DATA1 = STR_DATA1.getBytes();
     static final byte[] BYTES_DATA2 = STR_DATA2.getBytes();
 
+    static final String FILE_CREATION_ERROR_MESSAGE = "No such file or directory";
+
     // skips all test cases if FUSE is not active.
     @Before
     public void assumeFuseIsOn() {
         assumeTrue(getBoolean("sys.fuse_snapshot", false));
+        EXTERNAL_FILES_DIR.mkdirs();
     }
 
     /**
@@ -173,7 +176,7 @@ public class FilePathAccessTest {
         final File nonexistentPackageFileDir = new File(EXTERNAL_FILES_DIR.getPath()
                 .replace(THIS_PACKAGE_NAME, "no.such.package"));
         final File file1 = new File(nonexistentPackageFileDir, NONMEDIA_FILE_NAME);
-        assertThrows(IOException.class, "No such file or directory",
+        assertThrows(IOException.class, FILE_CREATION_ERROR_MESSAGE,
                 () -> { file1.createNewFile(); });
 
         // Creating a file in an existent package dir should give the same error string to avoid
@@ -182,7 +185,7 @@ public class FilePathAccessTest {
         final File shellPackageFileDir = new File(EXTERNAL_FILES_DIR.getPath()
                 .replace(THIS_PACKAGE_NAME, "com.android.shell"));
         final File file2 = new File(shellPackageFileDir, NONMEDIA_FILE_NAME);
-        assertThrows(IOException.class, "No such file or directory",
+        assertThrows(IOException.class, FILE_CREATION_ERROR_MESSAGE,
                 () -> { file1.createNewFile(); });
         try {
             // On the other hand, shell can create the file
@@ -251,6 +254,76 @@ public class FilePathAccessTest {
                 selection, selectionArgs, null)) {
             assertThat(c.getCount()).isEqualTo(0);
         }
+    }
+
+    @Test
+    public void testCreateAndDeleteEmptyDir() throws Exception {
+        // Remove directory in order to create it again
+        EXTERNAL_FILES_DIR.delete();
+
+        // Can create own external files dir
+        assertThat(EXTERNAL_FILES_DIR.mkdir()).isTrue();
+
+        final File dir1 = new File(EXTERNAL_FILES_DIR, "random_dir");
+        // Can create dirs inside it
+        assertThat(dir1.mkdir()).isTrue();
+
+        final File dir2 = new File(dir1, "random_dir_inside_random_dir");
+        // And create a dir inside the new dir
+        assertThat(dir2.mkdir());
+
+        // And can delete them all
+        assertThat(dir2.delete()).isTrue();
+        assertThat(dir1.delete()).isTrue();
+        assertThat(EXTERNAL_FILES_DIR.delete()).isTrue();
+
+        // Can't create external dir for other apps
+        final File nonexistentPackageFileDir = new File(EXTERNAL_FILES_DIR.getPath()
+                .replace(THIS_PACKAGE_NAME, "no.such.package"));
+        final File shellPackageFileDir = new File(EXTERNAL_FILES_DIR.getPath()
+                .replace(THIS_PACKAGE_NAME, "com.android.shell"));
+
+        assertThat(nonexistentPackageFileDir.mkdir()).isFalse();
+        assertThat(shellPackageFileDir.mkdir()).isFalse();
+    }
+
+    @Test
+    public void testDeleteNonemptyDir() throws Exception {
+        // TODO(b/142806973): use multi app infra which will be introduced in ag/9730872 to try and
+        // delete directories that have files contributed by other apps
+    }
+
+    /**
+     * This test relies on the fact that {@link File#list} uses opendir internally, and that it
+     * returns {@code null} if opendir fails.
+     */
+    @Test
+    public void testOpendirRestrictions() throws Exception {
+        // Opening a non existent package directory should fail, as expected
+        final File nonexistentPackageFileDir = new File(EXTERNAL_FILES_DIR.getPath()
+                .replace(THIS_PACKAGE_NAME, "no.such.package"));
+        assertThat(nonexistentPackageFileDir.list()).isNull();
+
+        // Opening another package's external directory should fail as well, even if it exists
+        final File shellPackageFileDir = new File(EXTERNAL_FILES_DIR.getPath()
+                .replace(THIS_PACKAGE_NAME, "com.android.shell"));
+        assertThat(shellPackageFileDir.list()).isNull();
+
+        // We can open our own external files directory
+        final String[] filesList = EXTERNAL_FILES_DIR.list();
+        assertThat(filesList).isNotNull();
+        assertThat(filesList).isEmpty();
+
+        // We can open any public directory in external storage
+        assertThat(DCIM_DIR.list()).isNotNull();
+        assertThat(DOWNLOAD_DIR.list()).isNotNull();
+        assertThat(MOVIES_DIR.list()).isNotNull();
+        assertThat(MUSIC_DIR.list()).isNotNull();
+
+        // We can open the root directory of external storage
+        final String[] topLevelDirs = EXTERNAL_STORAGE_DIR.list();
+        assertThat(topLevelDirs).isNotNull();
+        assertThat(topLevelDirs).isNotEmpty();
     }
 
     @Test

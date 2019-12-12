@@ -28,6 +28,7 @@
 #include <string>
 #include <thread>
 
+#include "libfuse_jni/ReaddirHelper.h"
 #include "libfuse_jni/RedactionInfo.h"
 
 namespace mediaprovider {
@@ -80,6 +81,20 @@ class MediaProviderWrapper final {
     int DeleteFile(const std::string& path, uid_t uid);
 
     /**
+     * Gets directory entries for given relative path from MediaProvider database.
+     *
+     * @param uid UID of the calling app.
+     * @param path Relative path of the directory.
+     * @param dirp pointer to directory stream
+     * @return DirectoryEntries with list of directory entries on success,
+     * DirectoryEntries with an empty list if directory path is unknown to MediaProvider
+     * or no directory entries are visible to the calling app.
+     */
+    std::vector<std::shared_ptr<DirectoryEntry>> GetDirectoryEntries(uid_t uid,
+                                                                     const std::string& path,
+                                                                     DIR* dirp);
+
+    /**
      * Determines if the given UID is allowed to open the file denoted by the given path.
      *
      * @param path the path of the file to be opened
@@ -97,6 +112,33 @@ class MediaProviderWrapper final {
      */
     void ScanFile(const std::string& path);
 
+    /**
+     * Determines if the given UID is allowed to create a directory with the given path.
+     *
+     * @param path the path of the directory to be created
+     * @param uid UID of the calling app
+     * @return 0 if it's allowed, or negated errno error code if operation isn't allowed.
+     */
+    int IsCreatingDirAllowed(const std::string& path, uid_t uid);
+
+    /**
+     * Determines if the given UID is allowed to delete the directory with the given path.
+     *
+     * @param path the path of the directory to be deleted
+     * @param uid UID of the calling app
+     * @return 0 if it's allowed, or negated errno error code if operation isn't allowed.
+     */
+    int IsDeletingDirAllowed(const std::string& path, uid_t uid);
+
+    /**
+     * Determines if the given UID is allowed to open the directory with the given path.
+     *
+     * @param path the path of the directory to be opened
+     * @param uid UID of the calling app
+     * @return 0 if it's allowed, or negated errno error code if operation isn't allowed.
+     */
+    int IsOpendirAllowed(const std::string& path, uid_t uid);
+
   private:
     jclass media_provider_class_;
     jobject media_provider_object_;
@@ -106,6 +148,9 @@ class MediaProviderWrapper final {
     jmethodID mid_delete_file_;
     jmethodID mid_is_open_allowed_;
     jmethodID mid_scan_file_;
+    jmethodID mid_is_dir_op_allowed_;
+    jmethodID mid_is_opendir_allowed_;
+    jmethodID mid_get_directory_entries_;
     /**
      * All JNI calls are delegated to this thread
      */
