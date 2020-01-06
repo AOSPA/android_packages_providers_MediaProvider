@@ -19,7 +19,6 @@ package com.android.providers.media;
 import static android.provider.MediaStore.Downloads.isDownload;
 import static android.provider.MediaStore.Downloads.isDownloadDir;
 
-import static com.android.providers.media.MediaProvider.ensureFileColumns;
 import static com.android.providers.media.MediaProvider.extractPathOwnerPackageName;
 
 import static org.junit.Assert.assertArrayEquals;
@@ -53,6 +52,7 @@ import com.android.providers.media.scan.MediaScannerTest.IsolatedContext;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Locale;
 import java.util.regex.Pattern;
@@ -520,6 +520,32 @@ public class MediaProviderTest {
         }
     }
 
+    @Test
+    public void testRelativePathForInvalidDirectories() throws Exception {
+        for (String data : new String[] {
+            "/storage/IMG1024.JPG",
+            "/data/media/IMG1024.JPG",
+            "IMG1024.JPG",
+            "storage/emulated/",
+        }) {
+            assertEquals(MediaProvider.extractRelativePathForDirectory(data), null);
+        }
+    }
+
+    @Test
+    public void testRelativePathForValidDirectories() throws Exception {
+        for (Pair<String, String> top: new ArrayList<Pair<String, String>>() {{
+            add(new Pair("/storage/emulated/0", new String("")));
+            add(new Pair("/storage/emulated/0/DCIM", "DCIM/"));
+            add(new Pair("/storage/emulated/0/DCIM/Camera", "DCIM/Camera/"));
+            add(new Pair("/storage/emulated/0/Android/media/com.example/Foo",
+                    "Android/media/com.example/Foo/"));
+            add(new Pair("/storage/0000-0000/DCIM/Camera", "DCIM/Camera/"));
+        }}) {
+            assertEquals(top.second, MediaProvider.extractRelativePathForDirectory(top.first));
+        }
+    }
+
     private static ContentValues computeDataValues(String path) {
         final ContentValues values = new ContentValues();
         values.put(MediaColumns.DATA, path);
@@ -575,7 +601,7 @@ public class MediaProviderTest {
         values.put(MediaColumns.DISPLAY_NAME, displayName);
         values.put(MediaColumns.MIME_TYPE, mimeType);
         try {
-            ensureFileColumns(uri, values);
+            new MediaProvider().ensureFileColumns(uri, values);
         } catch (VolumeArgumentException e) {
             throw e.rethrowAsIllegalArgumentException();
         }

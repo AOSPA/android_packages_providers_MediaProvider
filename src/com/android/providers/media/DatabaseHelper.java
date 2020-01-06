@@ -33,6 +33,7 @@ import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteOpenHelper;
 import android.mtp.MtpConstants;
 import android.net.Uri;
+import android.os.Bundle;
 import android.os.Environment;
 import android.os.Looper;
 import android.os.RemoteException;
@@ -57,6 +58,7 @@ import androidx.annotation.VisibleForTesting;
 
 import com.android.providers.media.util.BackgroundThread;
 import com.android.providers.media.util.DatabaseUtils;
+import com.android.providers.media.util.Metrics;
 
 import java.io.File;
 import java.io.FilenameFilter;
@@ -81,6 +83,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
     final Context mContext;
     final String mName;
     final int mVersion;
+    final String mVolumeName;
     final boolean mInternal;  // True if this is the internal database
     final boolean mEarlyUpgrade;
     final boolean mLegacyProvider;
@@ -99,6 +102,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         mContext = context;
         mName = name;
         mVersion = version;
+        mVolumeName = internal ? MediaStore.VOLUME_INTERNAL : MediaStore.VOLUME_EXTERNAL;
         mInternal = internal;
         mEarlyUpgrade = earlyUpgrade;
         mLegacyProvider = legacyProvider;
@@ -452,18 +456,18 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 return;
             }
 
-            final String volumeName = mInternal ? MediaStore.VOLUME_INTERNAL
-                    : MediaStore.VOLUME_EXTERNAL;
+            final Uri queryUri = MediaStore
+                    .rewriteToLegacy(MediaStore.Files.getContentUri(mVolumeName));
 
-            Uri queryUri = MediaStore.Files.getContentUri(volumeName);
-            queryUri = MediaStore.setIncludePending(queryUri);
-            queryUri = MediaStore.setIncludeTrashed(queryUri);
-            queryUri = MediaStore.rewriteToLegacy(queryUri);
+            final Bundle extras = new Bundle();
+            extras.putInt(MediaStore.QUERY_ARG_MATCH_PENDING, MediaStore.MATCH_INCLUDE);
+            extras.putInt(MediaStore.QUERY_ARG_MATCH_TRASHED, MediaStore.MATCH_INCLUDE);
+            extras.putInt(MediaStore.QUERY_ARG_MATCH_FAVORITE, MediaStore.MATCH_INCLUDE);
 
-            db.beginTransaction();
+            db.execSQL("SAVEPOINT before_migrate");
             Log.d(TAG, "Starting migration from legacy provider");
             try (Cursor c = client.query(queryUri, sMigrateColumns.toArray(new String[0]),
-                    null, null, null)) {
+                    extras, null)) {
                 final ContentValues values = new ContentValues();
                 while (c.moveToNext()) {
                     values.clear();
@@ -478,17 +482,14 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                     }
                 }
 
-                db.setTransactionSuccessful();
+                db.execSQL("RELEASE before_migrate");
                 Log.d(TAG, "Finished migration from legacy provider");
-            } catch (RemoteException e) {
-                throw new IllegalStateException(e);
-            } finally {
-                db.endTransaction();
+            } catch (Exception e) {
+                // We have to guard ourselves against any weird behavior of the
+                // legacy provider by trying to catch everything
+                db.execSQL("ROLLBACK TO before_migrate");
+                Log.w(TAG, "Failed migration from legacy provider: " + e);
             }
-        } catch (Exception e) {
-            // We have to guard ourselves against any weird behavior of the
-            // legacy provider by trying to catch everything
-            Log.w(TAG, "Failed migration from legacy provider: " + e);
         }
     }
 
@@ -929,10 +930,12 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
 
         getOrCreateUuid(db);
 
-        final long elapsedSeconds = (SystemClock.elapsedRealtime() - startTime)
-                / DateUtils.SECOND_IN_MILLIS;
+        final long elapsedMillis = (SystemClock.elapsedRealtime() - startTime);
+        final long elapsedSeconds = elapsedMillis / DateUtils.SECOND_IN_MILLIS;
         logToDb(db, "Database upgraded from version " + fromVersion + " to " + toVersion
                 + " in " + elapsedSeconds + " seconds");
+        Metrics.logSchemaChange(mVolumeName, fromVersion, toVersion,
+                getItemCount(db), elapsedMillis);
     }
 
     private void downgradeDatabase(SQLiteDatabase db, int fromVersion, int toVersion) {
@@ -941,10 +944,12 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         // The best we can do is wipe and start over
         createLatestSchema(db);
 
-        final long elapsedSeconds = (SystemClock.elapsedRealtime() - startTime)
-                / DateUtils.SECOND_IN_MILLIS;
+        final long elapsedMillis = (SystemClock.elapsedRealtime() - startTime);
+        final long elapsedSeconds = elapsedMillis / DateUtils.SECOND_IN_MILLIS;
         logToDb(db, "Database downgraded from version " + fromVersion + " to " + toVersion
                 + " in " + elapsedSeconds + " seconds");
+        Metrics.logSchemaChange(mVolumeName, fromVersion, toVersion,
+                getItemCount(db), elapsedMillis);
     }
 
     /**
@@ -982,5 +987,27 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 throw new RuntimeException(e);
             }
         }
+    }
+
+    /**
+     * Return total number of items tracked inside this database. This includes
+     * only real media items, and does not include directories.
+     */
+    public long getItemCount() {
+        return getItemCount(getReadableDatabase());
+    }
+
+    /**
+     * Return total number of items tracked inside this database. This includes
+     * only real media items, and does not include directories.
+     */
+    private long getItemCount(SQLiteDatabase db) {
+        try (Cursor c = db.query(false, "files", new String[] { "COUNT(_id)" },
+                FileColumns.MIME_TYPE + " IS NOT NULL", null, null, null, null, null, null)) {
+            if (c.moveToFirst()) {
+                return c.getLong(0);
+            }
+        }
+        return 0;
     }
 }
