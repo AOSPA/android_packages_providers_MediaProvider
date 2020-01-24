@@ -34,7 +34,6 @@ import static android.media.MediaMetadataRetriever.METADATA_KEY_DURATION;
 import static android.media.MediaMetadataRetriever.METADATA_KEY_GENRE;
 import static android.media.MediaMetadataRetriever.METADATA_KEY_IMAGE_HEIGHT;
 import static android.media.MediaMetadataRetriever.METADATA_KEY_IMAGE_WIDTH;
-import static android.media.MediaMetadataRetriever.METADATA_KEY_IS_DRM;
 import static android.media.MediaMetadataRetriever.METADATA_KEY_MIMETYPE;
 import static android.media.MediaMetadataRetriever.METADATA_KEY_NUM_TRACKS;
 import static android.media.MediaMetadataRetriever.METADATA_KEY_TITLE;
@@ -264,7 +263,7 @@ public class ModernMediaScanner implements MediaScanner {
 
             mRoot = root;
             mReason = reason;
-            mVolumeName = MediaStore.getVolumeName(root);
+            mVolumeName = FileUtils.getVolumeName(mContext, root);
             mFilesUri = MediaStore.Files.getContentUri(mVolumeName);
             mSignal = getOrCreateSignal(mVolumeName);
 
@@ -337,7 +336,7 @@ public class ModernMediaScanner implements MediaScanner {
             queryArgs.putString(ContentResolver.QUERY_ARG_SQL_SELECTION,
                     formatClause + " AND " + dataClause);
             queryArgs.putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS,
-                    new String[] { escapeForLike(mRoot.getAbsolutePath()) + '%' });
+                    new String[] { escapeForLike(mRoot.getAbsolutePath(), mSingleFile) });
             queryArgs.putString(ContentResolver.QUERY_ARG_SQL_SORT_ORDER,
                     FileColumns._ID + " DESC");
             queryArgs.putInt(MediaStore.QUERY_ARG_MATCH_PENDING, MediaStore.MATCH_INCLUDE);
@@ -652,15 +651,14 @@ public class ModernMediaScanner implements MediaScanner {
                 parseOptionalDate(mmr.extractMetadata(METADATA_KEY_DATE)));
         withOptionalValue(op, MediaColumns.MIME_TYPE,
                 parseOptionalMimeType(mimeType, mmr.extractMetadata(METADATA_KEY_MIMETYPE)));
-        withOptionalValue(op, MediaColumns.IS_DRM,
-                parseOptional(mmr.extractMetadata(METADATA_KEY_IS_DRM)));
 
         withOptionalValue(op, MediaColumns.CD_TRACK_NUMBER,
                 parseOptional(mmr.extractMetadata(METADATA_KEY_CD_TRACK_NUMBER)));
         withOptionalValue(op, MediaColumns.ALBUM,
                 parseOptional(mmr.extractMetadata(METADATA_KEY_ALBUM)));
-        withOptionalValue(op, MediaColumns.ARTIST,
-                parseOptional(mmr.extractMetadata(METADATA_KEY_ARTIST)));
+        withOptionalValue(op, MediaColumns.ARTIST, firstPresent(
+                parseOptional(mmr.extractMetadata(METADATA_KEY_ARTIST)),
+                parseOptional(mmr.extractMetadata(METADATA_KEY_ALBUMARTIST))));
         withOptionalValue(op, MediaColumns.AUTHOR,
                 parseOptional(mmr.extractMetadata(METADATA_KEY_AUTHOR)));
         withOptionalValue(op, MediaColumns.COMPOSER,
@@ -911,6 +909,19 @@ public class ModernMediaScanner implements MediaScanner {
         }
     }
 
+    /**
+     * Pick the first present {@link Optional} value from the given list.
+     */
+    @SafeVarargs
+    private static @NonNull <T> Optional<T> firstPresent(@NonNull Optional<T>... options) {
+        for (Optional<T> option : options) {
+            if (option.isPresent()) {
+                return option;
+            }
+        }
+        return Optional.empty();
+    }
+
     private static @NonNull <T> Optional<T> parseOptional(@Nullable T value) {
         if (value == null) {
             return Optional.empty();
@@ -1150,7 +1161,7 @@ public class ModernMediaScanner implements MediaScanner {
     /**
      * Escape the given argument for use in a {@code LIKE} statement.
      */
-    static String escapeForLike(String arg) {
+    static String escapeForLike(String arg, boolean singleFile) {
         final StringBuilder sb = new StringBuilder();
         for (int i = 0; i < arg.length(); i++) {
             final char c = arg.charAt(i);
@@ -1159,6 +1170,9 @@ public class ModernMediaScanner implements MediaScanner {
                 case '_': sb.append('\\');
             }
             sb.append(c);
+        }
+        if (!singleFile) {
+            sb.append('%');
         }
         return sb.toString();
     }

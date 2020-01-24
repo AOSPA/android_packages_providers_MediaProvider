@@ -19,22 +19,26 @@ package com.android.tests.fused.host;
 import static org.junit.Assert.assertTrue;
 import static com.google.common.truth.Truth.assertThat;
 
+import com.android.tradefed.device.ITestDevice;
 import com.android.tradefed.testtype.DeviceJUnit4ClassRunner;
+import com.android.tradefed.testtype.junit4.BaseHostJUnit4Test;
 
 import org.junit.After;
 import org.junit.Before;
-import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
 /**
  * Runs the legacy file path access tests.
  */
-@Ignore("b/137890172: waiting for ag/9733193")
 @RunWith(DeviceJUnit4ClassRunner.class)
-public class LegacyAccessHostTest extends FuseDaemonBaseHostTest {
+public class LegacyAccessHostTest extends BaseHostJUnit4Test {
 
     public static final String SHELL_FILE = "/sdcard/LegacyAccessHostTest_shell";
+
+    private String executeShellCommand(String cmd) throws Exception {
+        return getDevice().executeShellCommand(cmd);
+    }
 
     /**
      * Runs the given phase of LegacyFileAccessTest by calling into the device.
@@ -62,9 +66,27 @@ public class LegacyAccessHostTest extends FuseDaemonBaseHostTest {
         }
     }
 
-    private void createFile(String filePath) throws Exception {
-        executeShellCommand("touch " + filePath);
-        assertThat(getDevice().doesFileExist(filePath)).isTrue();
+    /**
+     * Creates a file {@code filePath} in shell and may bypass Media Provider restrictions for
+     * creating file.
+     */
+    private void createFileAsShell(String filePath, boolean bypassFuse) throws Exception {
+        if (bypassFuse) {
+            // Run shell as root to bypass Media Provider.
+            final ITestDevice device = getDevice();
+            final boolean isAdbRoot = device.isAdbRoot() ? true : false;
+            if (!isAdbRoot) {
+                device.enableAdbRoot();
+            }
+            executeShellCommand("touch " + filePath);
+            if (!isAdbRoot) {
+                device.disableAdbRoot();
+            }
+            assertThat(getDevice().doesFileExist(filePath)).isTrue();
+        } else {
+            executeShellCommand("touch " + filePath);
+            assertThat(getDevice().doesFileExist(filePath)).isTrue();
+        }
     }
 
     @Before
@@ -85,19 +107,21 @@ public class LegacyAccessHostTest extends FuseDaemonBaseHostTest {
     @Test
     public void testCreateFilesInRandomPlaces_hasW() throws Exception {
         revokePermissions("android.permission.READ_EXTERNAL_STORAGE");
+        executeShellCommand("mkdir -p /sdcard/Android/data/com.android.shell");
         runDeviceTest("testCreateFilesInRandomPlaces_hasW");
     }
 
     @Test
     public void testMkdirInRandomPlaces_hasW() throws Exception {
         revokePermissions("android.permission.READ_EXTERNAL_STORAGE");
+        executeShellCommand("mkdir -p /sdcard/Android/data/com.android.shell");
         runDeviceTest("testMkdirInRandomPlaces_hasW");
     }
 
     @Test
     public void testReadOnlyExternalStorage_hasR() throws Exception {
         revokePermissions("android.permission.WRITE_EXTERNAL_STORAGE");
-        createFile(SHELL_FILE);
+        createFileAsShell(SHELL_FILE, /*bypassFuse*/ true);
         try {
             runDeviceTest("testReadOnlyExternalStorage_hasR");
         } finally {
@@ -109,11 +133,23 @@ public class LegacyAccessHostTest extends FuseDaemonBaseHostTest {
     public void testCantAccessExternalStorage() throws Exception {
         revokePermissions("android.permission.WRITE_EXTERNAL_STORAGE",
                 "android.permission.READ_EXTERNAL_STORAGE");
-        createFile(SHELL_FILE);
+        createFileAsShell(SHELL_FILE, /*bypassFuse*/ true);
         try {
             runDeviceTest("testCantAccessExternalStorage");
         } finally {
             executeShellCommand("rm " + SHELL_FILE);
         }
+    }
+
+    @Test
+    public void testListFiles_hasR() throws Exception {
+        revokePermissions("android.permission.WRITE_EXTERNAL_STORAGE");
+        createFileAsShell(SHELL_FILE, /*bypassFuse*/ true);
+        try {
+            runDeviceTest("testListFiles_hasR");
+        } finally {
+            executeShellCommand("rm " + SHELL_FILE);
+        }
+
     }
 }

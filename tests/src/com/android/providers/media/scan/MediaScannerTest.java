@@ -16,6 +16,8 @@
 
 package com.android.providers.media.scan;
 
+import static android.provider.MediaStore.VOLUME_EXTERNAL;
+
 import static com.android.providers.media.scan.MediaScanner.REASON_UNKNOWN;
 
 import static org.junit.Assert.assertEquals;
@@ -42,7 +44,7 @@ import androidx.test.InstrumentationRegistry;
 import androidx.test.runner.AndroidJUnit4;
 
 import com.android.providers.media.MediaProvider;
-import com.android.providers.media.tests.R;
+import com.android.providers.media.R;
 import com.android.providers.media.util.FileUtils;
 
 import org.junit.Before;
@@ -87,7 +89,7 @@ public class MediaScannerTest {
                 }
             });
 
-            MediaStore.waitForIdle(this);
+            MediaStore.waitForIdle(mResolver);
         }
 
         @Override
@@ -217,10 +219,10 @@ public class MediaScannerTest {
 
     private static int[] getCounts(Context context) {
         return new int[] {
-                getCount(context, MediaStore.Files.EXTERNAL_CONTENT_URI),
-                getCount(context, MediaStore.Audio.Media.EXTERNAL_CONTENT_URI),
-                getCount(context, MediaStore.Video.Media.EXTERNAL_CONTENT_URI),
-                getCount(context, MediaStore.Images.Media.EXTERNAL_CONTENT_URI),
+                getCount(context, MediaStore.Files.getContentUri(VOLUME_EXTERNAL)),
+                getCount(context, MediaStore.Audio.Media.getContentUri(VOLUME_EXTERNAL)),
+                getCount(context, MediaStore.Video.Media.getContentUri(VOLUME_EXTERNAL)),
+                getCount(context, MediaStore.Images.Media.getContentUri(VOLUME_EXTERNAL)),
         };
     }
 

@@ -23,12 +23,11 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
-import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
 import android.database.Cursor;
 import android.database.sqlite.SQLiteDatabase;
-import android.mtp.MtpConstants;
+import android.provider.Column;
 import android.provider.MediaStore.Files.FileColumns;
 import android.util.Log;
 
@@ -181,7 +180,6 @@ public class DatabaseHelperTest {
                         "/storage/emulated/0/Download/foo");
                 values.put(FileColumns.DATE_ADDED, System.currentTimeMillis());
                 values.put(FileColumns.DATE_MODIFIED, System.currentTimeMillis());
-                values.put(FileColumns.FORMAT, MtpConstants.FORMAT_ASSOCIATION);
                 assertFalse(db.insert("files", FileColumns.DATA, values) == -1);
             }
             {
@@ -189,8 +187,6 @@ public class DatabaseHelperTest {
                 values.put(FileColumns.DATA, "/storage/emulated/0/Download/bar");
                 values.put(FileColumns.DATE_ADDED, System.currentTimeMillis());
                 values.put(FileColumns.DATE_MODIFIED, System.currentTimeMillis());
-                values.put(FileColumns.FORMAT, MtpConstants.FORMAT_ASSOCIATION);
-                values.put(FileColumns.MIME_TYPE, ContentResolver.MIME_TYPE_DEFAULT);
                 assertFalse(db.insert("files", FileColumns.DATA, values) == -1);
             }
         }
@@ -247,8 +243,6 @@ public class DatabaseHelperTest {
                     null, null, null, null)) {
                 assertEquals(1, c.getCount());
                 assertTrue(c.moveToFirst());
-                assertEquals(MtpConstants.FORMAT_ASSOCIATION,
-                        c.getInt(c.getColumnIndexOrThrow(FileColumns.FORMAT)));
                 assertNull(c.getString(c.getColumnIndexOrThrow(FileColumns.MIME_TYPE)));
                 assertEquals("foo", c.getString(c.getColumnIndexOrThrow(FileColumns.DISPLAY_NAME)));
                 assertEquals("1", c.getString(c.getColumnIndexOrThrow(FileColumns.IS_DOWNLOAD)));
@@ -258,8 +252,6 @@ public class DatabaseHelperTest {
                     null, null, null, null)) {
                 assertEquals(1, c.getCount());
                 assertTrue(c.moveToFirst());
-                assertEquals(MtpConstants.FORMAT_ASSOCIATION,
-                        c.getInt(c.getColumnIndexOrThrow(FileColumns.FORMAT)));
                 assertNull(c.getString(c.getColumnIndexOrThrow(FileColumns.MIME_TYPE)));
                 assertEquals("bar", c.getString(c.getColumnIndexOrThrow(FileColumns.DISPLAY_NAME)));
                 assertEquals("1", c.getString(c.getColumnIndexOrThrow(FileColumns.IS_DOWNLOAD)));
@@ -311,7 +303,7 @@ public class DatabaseHelperTest {
 
     private static class DatabaseHelperO extends DatabaseHelper {
         public DatabaseHelperO(Context context, String name) {
-            super(context, name, DatabaseHelper.VERSION_O, false, false, true);
+            super(context, name, DatabaseHelper.VERSION_O, false, false, true, Column.class, null);
         }
 
         @Override
@@ -322,7 +314,7 @@ public class DatabaseHelperTest {
 
     private static class DatabaseHelperP extends DatabaseHelper {
         public DatabaseHelperP(Context context, String name) {
-            super(context, name, DatabaseHelper.VERSION_P, false, false, true);
+            super(context, name, DatabaseHelper.VERSION_P, false, false, true, Column.class, null);
         }
 
         @Override
@@ -333,7 +325,7 @@ public class DatabaseHelperTest {
 
     private static class DatabaseHelperQ extends DatabaseHelper {
         public DatabaseHelperQ(Context context, String name) {
-            super(context, name, DatabaseHelper.VERSION_Q, false, false, true);
+            super(context, name, DatabaseHelper.VERSION_Q, false, false, true, Column.class, null);
         }
 
         @Override
@@ -344,7 +336,7 @@ public class DatabaseHelperTest {
 
     private static class DatabaseHelperR extends DatabaseHelper {
         public DatabaseHelperR(Context context, String name) {
-            super(context, name, DatabaseHelper.VERSION_R, false, false, true);
+            super(context, name, DatabaseHelper.VERSION_R, false, false, true, Column.class, null);
         }
     }
 

@@ -17,6 +17,7 @@
 package com.android.providers.media.util;
 
 import android.content.ClipDescription;
+import android.mtp.MtpConstants;
 import android.provider.MediaStore.Files.FileColumns;
 import android.webkit.MimeTypeMap;
 
@@ -63,6 +64,24 @@ public class MimeUtils {
         }
     }
 
+    /**
+     * Resolve the {@link FileColumns#FORMAT} of the given MIME type. Note that
+     * since this column isn't public API, we're okay only getting very rough
+     * values in place, and it's not worthwhile to build out complex matching.
+     */
+    public static int resolveFormatCode(@Nullable String mimeType) {
+        switch (resolveMediaType(mimeType)) {
+            case FileColumns.MEDIA_TYPE_AUDIO:
+                return MtpConstants.FORMAT_UNDEFINED_AUDIO;
+            case FileColumns.MEDIA_TYPE_VIDEO:
+                return MtpConstants.FORMAT_UNDEFINED_VIDEO;
+            case FileColumns.MEDIA_TYPE_IMAGE:
+                return MtpConstants.FORMAT_DEFINED;
+            default:
+                return MtpConstants.FORMAT_UNDEFINED;
+        }
+    }
+
     public static @NonNull String extractPrimaryType(@NonNull String mimeType) {
         final int slash = mimeType.indexOf('/');
         if (slash == -1) {
@@ -91,6 +110,7 @@ public class MimeUtils {
         switch (mimeType) {
             case "application/vnd.apple.mpegurl":
             case "application/vnd.ms-wpl":
+            case "application/x-extension-smpl":
             case "application/x-mpegurl":
             case "audio/mpegurl":
             case "audio/x-mpegurl":

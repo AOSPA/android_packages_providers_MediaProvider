@@ -19,69 +19,74 @@ package com.android.tests.fused;
 import static android.os.SystemProperties.getBoolean;
 import static android.provider.MediaStore.MediaColumns;
 
+import static androidx.test.InstrumentationRegistry.getContext;
+
+import static com.android.tests.fused.lib.RedactionTestHelper.assertExifMetadataMatch;
+import static com.android.tests.fused.lib.RedactionTestHelper.assertExifMetadataMismatch;
+import static com.android.tests.fused.lib.RedactionTestHelper.getExifMetadata;
+import static com.android.tests.fused.lib.RedactionTestHelper.getExifMetadataFromRawResource;
+import static com.android.tests.fused.lib.TestUtils.assertThrows;
+import static com.android.tests.fused.lib.TestUtils.createFileAs;
+import static com.android.tests.fused.lib.TestUtils.deleteFileAs;
+import static com.android.tests.fused.lib.TestUtils.executeShellCommand;
+import static com.android.tests.fused.lib.TestUtils.installApp;
+import static com.android.tests.fused.lib.TestUtils.listAs;
+import static com.android.tests.fused.lib.TestUtils.readExifMetadataFromTestApp;
+import static com.android.tests.fused.lib.TestUtils.revokeReadExternalStorage;
+import static com.android.tests.fused.lib.TestUtils.uninstallApp;
 import static com.google.common.truth.Truth.assertThat;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assume.assumeTrue;
-import static org.junit.Assert.fail;
 
-import android.app.ActivityManager;
-import android.app.UiAutomation;
-import android.content.BroadcastReceiver;
 import android.content.ContentResolver;
+import android.content.ContentUris;
+import android.content.ContentValues;
 import android.content.Context;
-import android.content.ClipDescription;
-import android.content.Intent;
-import android.content.IntentFilter;
 import android.database.Cursor;
+import android.net.Uri;
 import android.os.Environment;
+import android.os.FileUtils;
+import android.os.ParcelFileDescriptor;
 import android.provider.MediaStore;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.system.OsConstants;
 import android.util.Log;
-import android.Manifest;
-import android.webkit.MimeTypeMap;
 
 import androidx.test.InstrumentationRegistry;
 import androidx.test.runner.AndroidJUnit4;
 
+import com.android.cts.install.lib.Install;
+import com.android.cts.install.lib.TestApp;
+import com.android.cts.install.lib.TestApp;
+import com.android.tests.fused.lib.ReaddirTestHelper;
+import com.android.tests.fused.lib.ReaddirTestHelper;
 import com.google.common.io.ByteStreams;
-
-import org.junit.Before;
-import org.junit.Test;
-import org.junit.runner.RunWith;
 
 import java.io.File;
 import java.io.FileDescriptor;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
-import java.io.InputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.concurrent.CountDownLatch;
-import java.util.Locale;
+import java.util.Arrays;
+import java.util.HashMap;
 
-import com.android.cts.install.lib.Install;
-import com.android.cts.install.lib.InstallUtils;
-import com.android.cts.install.lib.Uninstall;
-import com.android.cts.install.lib.TestApp;
-import com.android.tests.fused.lib.ReaddirTestHelper;
-import static com.android.tests.fused.lib.ReaddirTestHelper.QUERY_TYPE;
-import static com.android.tests.fused.lib.ReaddirTestHelper.READDIR_QUERY;
-import static com.android.tests.fused.lib.ReaddirTestHelper.CREATE_FILE_QUERY;
-import static com.android.tests.fused.lib.ReaddirTestHelper.DELETE_FILE_QUERY;
+import org.junit.Before;
+import org.junit.Test;
+import org.junit.runner.RunWith;
 
 @RunWith(AndroidJUnit4.class)
 public class FilePathAccessTest {
     static final String TAG = "FilePathAccessTest";
-    static final String THIS_PACKAGE_NAME = FilePathAccessTest.class.getPackage().getName();
+    static final String THIS_PACKAGE_NAME = getContext().getPackageName();
 
     static final File EXTERNAL_STORAGE_DIR = Environment.getExternalStorageDirectory();
 
     static final File DCIM_DIR = new File(EXTERNAL_STORAGE_DIR, Environment.DIRECTORY_DCIM);
+    static final File PICTURES_DIR = new File(EXTERNAL_STORAGE_DIR, Environment.DIRECTORY_PICTURES);
     static final File MUSIC_DIR = new File(EXTERNAL_STORAGE_DIR, Environment.DIRECTORY_MUSIC);
     static final File MOVIES_DIR = new File(EXTERNAL_STORAGE_DIR, Environment.DIRECTORY_MOVIES);
     static final File DOWNLOAD_DIR = new File(EXTERNAL_STORAGE_DIR,
@@ -105,8 +110,6 @@ public class FilePathAccessTest {
     static final byte[] BYTES_DATA2 = STR_DATA2.getBytes();
 
     static final String FILE_CREATION_ERROR_MESSAGE = "No such file or directory";
-    private static final UiAutomation sUiAutomation = InstrumentationRegistry.getInstrumentation()
-            .getUiAutomation();
 
     private static final TestApp TEST_APP_A  = new TestApp("TestAppA",
             "com.android.tests.fused.testapp.A", 1, false, "TestAppA.apk");
@@ -116,7 +119,7 @@ public class FilePathAccessTest {
     // skips all test cases if FUSE is not active.
     @Before
     public void assumeFuseIsOn() {
-        assumeTrue(getBoolean("sys.fuse_snapshot", false));
+        assumeTrue(getBoolean("persist.sys.fuse", false));
         EXTERNAL_FILES_DIR.mkdirs();
     }
 
@@ -219,14 +222,6 @@ public class FilePathAccessTest {
         final File file2 = new File(shellPackageFileDir, NONMEDIA_FILE_NAME);
         assertThrows(IOException.class, FILE_CREATION_ERROR_MESSAGE,
                 () -> { file1.createNewFile(); });
-        try {
-            // On the other hand, shell can create the file
-            executeShellCommand("touch " + file2);
-            assertThat(executeShellCommand("ls " + shellPackageFileDir))
-                    .contains(NONMEDIA_FILE_NAME);
-        } finally {
-            executeShellCommand("rm " + file2);
-        }
     }
 
     /**
@@ -287,7 +282,7 @@ public class FilePathAccessTest {
 
         final File dir2 = new File(dir1, "random_dir_inside_random_dir");
         // And create a dir inside the new dir
-        assertThat(dir2.mkdir());
+        assertThat(dir2.mkdir()).isTrue();
 
         // And can delete them all
         assertThat(dir2.delete()).isTrue();
@@ -405,34 +400,28 @@ public class FilePathAccessTest {
 
             // Install TEST_APP_A and create media file in the new directory.
             installApp(TEST_APP_A, false);
-            assertThat(createFileFromTestApp(TEST_APP_A, videoFile.getPath())).isTrue();
+            assertThat(createFileAs(TEST_APP_A, videoFile.getPath())).isTrue();
             // TEST_APP_A should see TEST_DIRECTORY in DCIM and new file in TEST_DIRECTORY.
-            assertThat(listDirectoryEntriesFromTestApp(TEST_APP_A, DCIM_DIR.getPath()))
-                    .contains(TEST_DIRECTORY);
-            assertThat(listDirectoryEntriesFromTestApp(TEST_APP_A, dir.getPath()))
-                    .containsExactly(videoFileName);
+            assertThat(listAs(TEST_APP_A, DCIM_DIR.getPath())).contains(TEST_DIRECTORY);
+            assertThat(listAs(TEST_APP_A, dir.getPath())).containsExactly(videoFileName);
 
             // Install TEST_APP_B with storage permission.
             installApp(TEST_APP_B, true);
             // TEST_APP_B with storage permission should see TEST_DIRECTORY in DCIM and new file
             // in TEST_DIRECTORY.
-            assertThat(listDirectoryEntriesFromTestApp(TEST_APP_B, DCIM_DIR.getPath()))
-                    .contains(TEST_DIRECTORY);
-            assertThat(listDirectoryEntriesFromTestApp(TEST_APP_B, dir.getPath()))
-                    .containsExactly(videoFileName);
+            assertThat(listAs(TEST_APP_B, DCIM_DIR.getPath())).contains(TEST_DIRECTORY);
+            assertThat(listAs(TEST_APP_B, dir.getPath())).containsExactly(videoFileName);
 
             // Revoke storage permission for TEST_APP_B
             revokeReadExternalStorage(TEST_APP_B.getPackageName());
-            // TEST_APP_B without storage permission should not see TEST_DIRECTORY in DCIM and new
-            // file in new TEST_DIRECTORY.
-            assertThat(listDirectoryEntriesFromTestApp(TEST_APP_B, DCIM_DIR.getPath()))
-                    .doesNotContain(TEST_DIRECTORY);
-            assertThat(listDirectoryEntriesFromTestApp(TEST_APP_B, dir.getPath()))
-                    .doesNotContain(videoFileName);
+            // TEST_APP_B without storage permission should see TEST_DIRECTORY in DCIM and should
+            // not see new file in new TEST_DIRECTORY.
+            assertThat(listAs(TEST_APP_B, DCIM_DIR.getPath())).contains(TEST_DIRECTORY);
+            assertThat(listAs(TEST_APP_B, dir.getPath())).doesNotContain(videoFileName);
         } finally {
             uninstallApp(TEST_APP_B);
             if(videoFile.exists()) {
-                assertThat(deleteFileFromTestApp(TEST_APP_A, videoFile.getPath())).isTrue();
+                deleteFileAs(TEST_APP_A, videoFile.getPath());
             }
             if (dir.exists()) {
                   // Try deleting the directory. Do we delete directory if app doesn't own all
@@ -458,31 +447,25 @@ public class FilePathAccessTest {
 
             // Install TEST_APP_A and create non media file in the new directory.
             installApp(TEST_APP_A, false);
-            assertThat(createFileFromTestApp(TEST_APP_A, pdfFile.getPath())).isTrue();
+            assertThat(createFileAs(TEST_APP_A, pdfFile.getPath())).isTrue();
 
             // TEST_APP_A should see TEST_DIRECTORY in DOWNLOAD_DIR and new non media file in
             // TEST_DIRECTORY.
-            assertThat(listDirectoryEntriesFromTestApp(TEST_APP_A, DOWNLOAD_DIR.getPath()))
-                    .contains(TEST_DIRECTORY);
-            assertThat(listDirectoryEntriesFromTestApp(TEST_APP_A, dir.getPath()))
-                    .containsExactly(pdfFileName);
+            assertThat(listAs(TEST_APP_A, DOWNLOAD_DIR.getPath())).contains(TEST_DIRECTORY);
+            assertThat(listAs(TEST_APP_A, dir.getPath())).containsExactly(pdfFileName);
 
             // Install TEST_APP_B with storage permission.
             installApp(TEST_APP_B, true);
-            // TEST_APP_B with storage permission should not see TEST_DIRECTORY in DOWNLOAD_DIR
+            // TEST_APP_B with storage permission should see TEST_DIRECTORY in DOWNLOAD_DIR
             // and should not see new non media file in TEST_DIRECTORY.
-            assertThat(listDirectoryEntriesFromTestApp(TEST_APP_B, DOWNLOAD_DIR.getPath()))
-                    .doesNotContain(TEST_DIRECTORY);
-            assertThat(listDirectoryEntriesFromTestApp(TEST_APP_B, dir.getPath()))
-                    .doesNotContain(pdfFileName);
+            assertThat(listAs(TEST_APP_B, DOWNLOAD_DIR.getPath())).contains(TEST_DIRECTORY);
+            assertThat(listAs(TEST_APP_B, dir.getPath())).doesNotContain(pdfFileName);
         } finally {
             uninstallApp(TEST_APP_B);
             if(pdfFile.exists()) {
-                assertThat(deleteFileFromTestApp(TEST_APP_A, pdfFile.getPath())).isTrue();
+                deleteFileAs(TEST_APP_A, pdfFile.getPath());
             }
             if (dir.exists()) {
-                  // Try deleting the directory. Do we delete directory if app doesn't own all
-                  // files in it?
                   dir.delete();
             }
             uninstallApp(TEST_APP_A);
@@ -494,7 +477,7 @@ public class FilePathAccessTest {
      */
     @Test
     public void testListFilesFromExternalFilesDirectory() throws Exception {
-        final String packageName = getContext().getPackageName();
+        final String packageName = THIS_PACKAGE_NAME;
         final File videoFile = new File(EXTERNAL_FILES_DIR, NONMEDIA_FILE_NAME);
         final String videoFileName = videoFile.getName();
 
@@ -505,18 +488,18 @@ public class FilePathAccessTest {
             }
             // App should see its directory and directories of shared packages. App should see all
             // files and directories in its external directory.
-            assertThat(ReaddirTestHelper.readDirectory(ANDROID_DATA_DIR)).contains(packageName);
             assertThat(ReaddirTestHelper.readDirectory(videoFile.getParentFile()))
                     .containsExactly(videoFileName);
 
             // Install TEST_APP_A with READ_EXTERNAL_STORAGE permission.
             // TEST_APP_A should not see other app's external files directory.
             installApp(TEST_APP_A, true);
-            assertThat(listDirectoryEntriesFromTestApp(TEST_APP_A, ANDROID_DATA_DIR.getPath()))
-                    .doesNotContain(packageName);
-            assertThat(listDirectoryEntriesFromTestApp(TEST_APP_A, EXTERNAL_FILES_DIR.getPath())).isEmpty();
+            // TODO(b/146497700): This is passing because ReaddirTestHelper ignores IOException and
+            //  returns empty list.
+            assertThat(listAs(TEST_APP_A, ANDROID_DATA_DIR.getPath())).doesNotContain(packageName);
+            assertThat(listAs(TEST_APP_A, EXTERNAL_FILES_DIR.getPath())).isEmpty();
         } finally {
-            assertThat(videoFile.delete()).isTrue();
+            videoFile.delete();
         }
     }
 
@@ -525,7 +508,7 @@ public class FilePathAccessTest {
      */
     @Test
     public void testListFilesFromExternalMediaDirectory() throws Exception {
-        final String packageName = getContext().getPackageName();
+        final String packageName = THIS_PACKAGE_NAME;
         final File videoFile = new File(EXTERNAL_MEDIA_DIR, VIDEO_FILE_NAME);
         final String videoFileName = videoFile.getName();
 
@@ -537,7 +520,8 @@ public class FilePathAccessTest {
 
             // App should see its directory and other app's external media directories with media
             // files.
-            assertThat(ReaddirTestHelper.readDirectory(ANDROID_MEDIA_DIR)).contains(packageName);
+            // TODO(b/145757667): Uncomment this when we start indexing Android/media files.
+            // assertThat(ReaddirTestHelper.readDirectory(ANDROID_MEDIA_DIR)).contains(packageName);
             assertThat(ReaddirTestHelper.readDirectory(EXTERNAL_MEDIA_DIR))
                     .containsExactly(videoFileName);
 
@@ -560,8 +544,427 @@ public class FilePathAccessTest {
         }
     }
 
-    private static Context getContext() {
-        return InstrumentationRegistry.getContext();
+    /**
+     * Test that readdir lists unsupported file types in default directories.
+     */
+    @Test
+    public void testListUnsupportedFileType() throws Exception {
+        final File pdfFile = new File(DCIM_DIR, NONMEDIA_FILE_NAME);
+        final File videoFile = new File(MUSIC_DIR, VIDEO_FILE_NAME);
+        try {
+            // TEST_APP_A with storage permission should not see pdf file in DCIM
+            executeShellCommand("touch " + pdfFile.getAbsolutePath());
+            assertThat(pdfFile.exists()).isTrue();
+            assertThat(MediaStore.scanFile(getContentResolver(), pdfFile)).isNotNull();
+
+            installApp(TEST_APP_A, true);
+            assertThat(listAs(TEST_APP_A, DCIM_DIR.getPath())).doesNotContain(NONMEDIA_FILE_NAME);
+
+            // TEST_APP_A with storage permission should see video file in Music directory.
+            executeShellCommand("touch " + videoFile.getAbsolutePath());
+            assertThat(MediaStore.scanFile(getContentResolver(), videoFile)).isNotNull();
+            assertThat(listAs(TEST_APP_A, MUSIC_DIR.getPath())).contains(VIDEO_FILE_NAME);
+        } finally {
+            executeShellCommand("rm " + pdfFile.getAbsolutePath());
+            executeShellCommand("rm " + videoFile.getAbsolutePath());
+        }
+    }
+
+    @Test
+    public void testMetaDataRedaction() throws Exception {
+        File jpgFile = new File(PICTURES_DIR, "img_metadata.jpg");
+        try {
+            if (jpgFile.exists()) {
+                assertThat(jpgFile.delete()).isTrue();
+            }
+
+            HashMap<String, String> originalExif = getExifMetadataFromRawResource(
+                    R.raw.img_with_metadata);
+
+            try (InputStream in = getContext().getResources().openRawResource(
+                    R.raw.img_with_metadata);
+                 OutputStream out = new FileOutputStream(jpgFile)) {
+                // Dump the image we have to external storage
+                FileUtils.copy(in, out);
+            }
+
+            HashMap<String, String> exif = getExifMetadata(jpgFile);
+            assertExifMetadataMatch(exif, originalExif);
+
+            installApp(TEST_APP_A, /*grantStoragePermissions*/ true);
+            HashMap<String, String> exifFromTestApp = readExifMetadataFromTestApp(TEST_APP_A,
+                    jpgFile.getPath());
+            // Other apps shouldn't have access to the same metadata without explicit permission
+            assertExifMetadataMismatch(exifFromTestApp, originalExif);
+
+            // TODO(b/146346138): Test that if we give TEST_APP_A write URI permission,
+            //  it would be able to access the metadata.
+        } finally {
+            jpgFile.delete();
+            uninstallApp(TEST_APP_A);
+        }
+    }
+
+    @Test
+    public void testOpenFilePathFirstWriteContentResolver() throws Exception {
+        String displayName = "open_file_path_write_content_resolver.jpg";
+        File file = new File(DCIM_DIR, displayName);
+
+        try {
+            assertThat(file.createNewFile()).isTrue();
+
+            ParcelFileDescriptor readPfd = ParcelFileDescriptor.open(file,
+                    ParcelFileDescriptor.MODE_READ_WRITE);
+            ParcelFileDescriptor writePfd = openWithMediaProvider(Environment.DIRECTORY_DCIM,
+                    displayName, "rw");
+
+            assertRWR(readPfd.getFileDescriptor(), writePfd.getFileDescriptor());
+        } finally {
+            file.delete();
+        }
+    }
+
+    @Test
+    public void testOpenContentResolverFirstWriteContentResolver() throws Exception {
+        String displayName = "open_content_resolver_write_content_resolver.jpg";
+        File file = new File(DCIM_DIR, displayName);
+
+        try {
+            assertThat(file.createNewFile()).isTrue();
+
+            ParcelFileDescriptor writePfd = openWithMediaProvider(Environment.DIRECTORY_DCIM,
+                    displayName, "rw");
+            ParcelFileDescriptor readPfd = ParcelFileDescriptor.open(file,
+                    ParcelFileDescriptor.MODE_READ_WRITE);
+
+            assertRWR(readPfd.getFileDescriptor(), writePfd.getFileDescriptor());
+        } finally {
+            file.delete();
+        }
+    }
+
+    @Test
+    public void testOpenFilePathFirstWriteFilePath() throws Exception {
+        String displayName = "open_file_path_write_file_path.jpg";
+        File file = new File(DCIM_DIR, displayName);
+
+        try {
+            assertThat(file.createNewFile()).isTrue();
+
+            ParcelFileDescriptor writePfd = ParcelFileDescriptor.open(file,
+                    ParcelFileDescriptor.MODE_READ_WRITE);
+            ParcelFileDescriptor readPfd = openWithMediaProvider(Environment.DIRECTORY_DCIM,
+                    displayName, "rw");
+
+            assertRWR(readPfd.getFileDescriptor(), writePfd.getFileDescriptor());
+        } finally {
+            file.delete();
+        }
+    }
+
+    @Test
+    public void testOpenContentResolverFirstWriteFilePath() throws Exception {
+        String displayName = "open_content_resolver_write_file_path.jpg";
+        File file = new File(DCIM_DIR, displayName);
+
+        try {
+            assertThat(file.createNewFile()).isTrue();
+
+            ParcelFileDescriptor readPfd = openWithMediaProvider(Environment.DIRECTORY_DCIM,
+                    displayName, "rw");
+            ParcelFileDescriptor writePfd = ParcelFileDescriptor.open(file,
+                    ParcelFileDescriptor.MODE_READ_WRITE);
+
+            assertRWR(readPfd.getFileDescriptor(), writePfd.getFileDescriptor());
+        } finally {
+            file.delete();
+        }
+    }
+
+    @Test
+    public void testOpenContentResolverWriteOnly() throws Exception {
+        String displayName = "open_content_resolver_write_only.jpg";
+        File file = new File(DCIM_DIR, displayName);
+
+        try {
+            assertThat(file.createNewFile()).isTrue();
+
+            // Since we can only place one F_WRLCK, the second open for readPfd will go
+            // throuh FUSE
+            ParcelFileDescriptor writePfd = openWithMediaProvider(Environment.DIRECTORY_DCIM,
+                    displayName, "w");
+            ParcelFileDescriptor readPfd = openWithMediaProvider(Environment.DIRECTORY_DCIM,
+                    displayName, "rw");
+
+            assertRWR(readPfd.getFileDescriptor(), writePfd.getFileDescriptor());
+        } finally {
+            file.delete();
+        }
+    }
+
+    @Test
+    public void testOpenContentResolverDup() throws Exception {
+        String displayName = "open_content_resolver_dup.jpg";
+        File file = new File(DCIM_DIR, displayName);
+
+        try {
+            assertThat(file.createNewFile()).isTrue();
+
+            // Even if we close the original fd, since we have a dup open
+            // the FUSE IO should still bypass the cache
+            ParcelFileDescriptor writePfd = openWithMediaProvider(Environment.DIRECTORY_DCIM,
+                    displayName, "rw");
+            ParcelFileDescriptor writePfdDup = writePfd.dup();
+            writePfd.close();
+            ParcelFileDescriptor readPfd = ParcelFileDescriptor.open(file,
+                    ParcelFileDescriptor.MODE_READ_WRITE);
+
+            assertRWR(readPfd.getFileDescriptor(), writePfdDup.getFileDescriptor());
+        } finally {
+            file.delete();
+        }
+    }
+
+    @Test
+    public void testContentResolverDelete() throws Exception {
+        String displayName = "content_resolver_delete.jpg";
+        File file = new File(DCIM_DIR, displayName);
+
+        try {
+            assertThat(file.createNewFile()).isTrue();
+
+            deleteWithMediaProvider(Environment.DIRECTORY_DCIM, displayName);
+
+            assertThat(file.exists()).isFalse();
+            assertThat(file.createNewFile()).isTrue();
+        } finally {
+            file.delete();
+        }
+    }
+
+    @Test
+    public void testContentResolverUpdate() throws Exception {
+        String oldDisplayName = "content_resolver_update_old.jpg";
+        String newDisplayName = "content_resolver_update_new.jpg";
+        File oldFile = new File(DCIM_DIR, oldDisplayName);
+        File newFile = new File(DCIM_DIR, newDisplayName);
+
+        try {
+            assertThat(oldFile.createNewFile()).isTrue();
+
+            updateWithMediaProvider(Environment.DIRECTORY_DCIM, oldDisplayName, newDisplayName);
+
+            assertThat(oldFile.exists()).isFalse();
+            assertThat(oldFile.createNewFile()).isTrue();
+            assertThat(newFile.exists()).isTrue();
+            assertThat(newFile.createNewFile()).isFalse();
+        } finally {
+            oldFile.delete();
+            newFile.delete();
+        }
+    }
+
+    /**
+     * Test that basic file path restrictions are enforced on file rename.
+     */
+    @Test
+    public void testRenameFile() throws Exception {
+        final File nonMediaDir = new File(DOWNLOAD_DIR, TEST_DIRECTORY);
+        final File pdfFile1 = new File(DOWNLOAD_DIR, NONMEDIA_FILE_NAME);
+        final File pdfFile2 = new File(nonMediaDir, NONMEDIA_FILE_NAME);
+        final File videoFile1 = new File(DCIM_DIR, VIDEO_FILE_NAME);
+        final File videoFile2 = new File(MOVIES_DIR, VIDEO_FILE_NAME);
+        final File videoFile3 = new File(DOWNLOAD_DIR, VIDEO_FILE_NAME);
+
+        try {
+            // Rename Non-media file
+            assertThat(pdfFile1.createNewFile()).isTrue();
+            if (!nonMediaDir.exists()) {
+                assertThat(nonMediaDir.mkdirs()).isTrue();
+            }
+            assertThat(pdfFile1.renameTo(pdfFile2)).isTrue();
+            assertThat(pdfFile1.exists()).isFalse();
+            assertThat(pdfFile2.exists()).isTrue();
+
+            assertThat(pdfFile2.renameTo(pdfFile1)).isTrue();
+            assertThat(pdfFile2.exists()).isFalse();
+            assertThat(pdfFile1.exists()).isTrue();
+
+            // Rename media file
+            assertThat(videoFile1.createNewFile()).isTrue();
+            assertThat(videoFile1.renameTo(videoFile2)).isTrue();
+            assertThat(videoFile1.exists()).isFalse();
+            assertThat(videoFile2.exists()).isTrue();
+
+            assertThat(videoFile2.renameTo(videoFile3)).isTrue();
+            assertThat(videoFile2.exists()).isFalse();
+            assertThat(videoFile3.exists()).isTrue();
+
+            // Move video file back to DCIM to ensure database entry is deleted on delete().
+            assertThat(videoFile3.renameTo(videoFile1)).isTrue();
+        } finally {
+            pdfFile1.delete();
+            pdfFile2.delete();
+            videoFile1.delete();
+            videoFile2.delete();
+            videoFile3.delete();
+            nonMediaDir.delete();
+        }
+    }
+
+    /**
+     * Test that renaming directories is allowed and aligns to default directory restrictions.
+     */
+    @Test
+    public void testRenameDirectory() throws Exception {
+
+        final String mediaDirectoryName = TEST_DIRECTORY + "Media";
+        final File mediaDirectory1 = new File(DCIM_DIR, mediaDirectoryName);
+        final File videoFile1 = new File(mediaDirectory1, VIDEO_FILE_NAME);
+        final File mediaDirectory2 =  new File(DOWNLOAD_DIR, mediaDirectoryName);
+        final File videoFile2 = new File(mediaDirectory2, VIDEO_FILE_NAME);
+        final File mediaDirectory3 =  new File(MOVIES_DIR, TEST_DIRECTORY);
+        final File videoFile3 = new File(mediaDirectory3, VIDEO_FILE_NAME);
+
+        try {
+            if (!mediaDirectory1.exists()) {
+                assertThat(mediaDirectory1.mkdirs()).isTrue();
+            }
+            assertThat(videoFile1.createNewFile()).isTrue();
+
+            // Renaming to and from default directories is not allowed.
+            assertThat(mediaDirectory1.renameTo(DCIM_DIR)).isFalse();
+            // Move top level default directories
+            assertThat(DOWNLOAD_DIR.renameTo(new File(DCIM_DIR, TEST_DIRECTORY))).isFalse();
+
+            // Move media directory to Download directory.
+            assertThat(mediaDirectory1.renameTo(mediaDirectory2)).isTrue();
+            assertThat(mediaDirectory1.exists()).isFalse();
+            assertThat(mediaDirectory2.exists()).isTrue();
+            assertThat(videoFile1.exists()).isFalse();
+            assertThat(videoFile2.exists()).isTrue();
+
+            // Move media directory to Movies directory and rename directory in new path.
+            assertThat(mediaDirectory2.renameTo(mediaDirectory3)).isTrue();
+            assertThat(mediaDirectory2.exists()).isFalse();
+            assertThat(mediaDirectory3.exists()).isTrue();
+            assertThat(videoFile2.exists()).isFalse();
+            assertThat(videoFile3.exists()).isTrue();
+
+            // Move videoFile back to original directory to ensure database entry for video file
+            // is deleted on delete().
+            assertThat(mediaDirectory3.renameTo(mediaDirectory1)).isTrue();
+        } finally {
+            videoFile1.delete();
+            videoFile2.delete();
+            videoFile3.delete();
+            mediaDirectory1.delete();
+            mediaDirectory2.delete();
+            mediaDirectory3.delete();
+        }
+    }
+
+    /**
+     * Test renaming empty directory is allowed
+     */
+    @Test
+    public void testRenameEmptyDirectory() throws Exception {
+        final String emptyDirectoryName = TEST_DIRECTORY + "Media";
+        File emptyDirectoryOldPath = new File(DCIM_DIR, emptyDirectoryName);
+        File emptyDirectoryNewPath = new File(MOVIES_DIR, TEST_DIRECTORY);
+        try {
+            if (!emptyDirectoryOldPath.exists()) {
+                assertThat(emptyDirectoryOldPath.mkdirs()).isTrue();
+                assertThat(emptyDirectoryOldPath.renameTo(emptyDirectoryNewPath)).isTrue();
+                assertThat(emptyDirectoryNewPath.exists()).isTrue();
+            }
+        } finally {
+            emptyDirectoryOldPath.delete();
+            emptyDirectoryNewPath.delete();
+        }
+    }
+
+    private void deleteWithMediaProvider(String relativePath, String displayName) throws Exception {
+        String selection = MediaColumns.RELATIVE_PATH + " = ? AND "
+                + MediaColumns.DISPLAY_NAME + " = ?";
+        String[] selectionArgs = { relativePath + '/', displayName };
+
+        assertThat(getContentResolver().delete(MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                        selection, selectionArgs)).isEqualTo(1);
+    }
+
+    private void updateWithMediaProvider(String relativePath, String oldDisplayName,
+            String newDisplayName) throws Exception {
+        String selection = MediaColumns.RELATIVE_PATH + " = ? AND "
+                + MediaColumns.DISPLAY_NAME + " = ?";
+        String[] selectionArgs = { relativePath + '/', oldDisplayName };
+        String[] projection = {MediaColumns._ID, MediaColumns.DATA};
+
+        ContentValues values = new ContentValues();
+        values.put(MediaColumns.DISPLAY_NAME, newDisplayName);
+
+        try (final Cursor cursor = getContentResolver().query(
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI, projection, selection, selectionArgs,
+                null)) {
+            assertThat(cursor.getCount()).isEqualTo(1);
+            cursor.moveToFirst();
+            int id = cursor.getInt(cursor.getColumnIndex(MediaColumns._ID));
+            String data = cursor.getString(cursor.getColumnIndex(MediaColumns.DATA));
+            Uri uri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id);
+            Log.i(TAG, "Uri: " + uri + ". Data: " + data);
+            assertThat(getContentResolver().update(uri, values, selection, selectionArgs))
+                    .isEqualTo(1);
+        }
+    }
+
+
+    /**
+     * Assert that the last read in: read - write - read using {@code readFd} and {@code writeFd}
+     * see the last write. {@code readFd} and {@code writeFd} are fds pointing to the same
+     * underlying file on disk but may be derived from different mount points and in that case
+     * have separate VFS caches.
+     */
+    private void assertRWR(FileDescriptor readFd, FileDescriptor writeFd) throws Exception {
+        byte[] readBuffer = new byte[10];
+        byte[] writeBuffer = new byte[10];
+        Arrays.fill(writeBuffer, (byte) 1);
+
+        // Write so readFd has content to read from next
+        Os.pwrite(readFd, readBuffer, 0, 10, 0);
+        // Read so readBuffer is in readFd's mount VFS cache
+        Os.pread(readFd, readBuffer, 0, 10, 0);
+
+        // Assert that readBuffer is zeroes
+        assertThat(readBuffer).isEqualTo(new byte[10]);
+
+        // Write so writeFd and readFd should now see writeBuffer
+        Os.pwrite(writeFd, writeBuffer, 0, 10, 0);
+
+        // Read so the last write can be verified on readFd
+        Os.pread(readFd, readBuffer, 0, 10, 0);
+
+        // Assert that the last write is indeed visible via readFd
+        assertThat(readBuffer).isEqualTo(writeBuffer);
+    }
+
+    private ParcelFileDescriptor openWithMediaProvider(String relativePath, String displayName,
+            String mode) throws Exception {
+        String selection = MediaColumns.RELATIVE_PATH + " = ? AND "
+                + MediaColumns.DISPLAY_NAME + " = ?";
+        String[] selectionArgs = { relativePath + '/', displayName };
+        String[] projection = {MediaColumns._ID, MediaColumns.DATA};
+
+        try (final Cursor cursor = getContentResolver().query(
+                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI, projection, selection,
+                        selectionArgs, null)) {
+            assertThat(cursor.getCount()).isEqualTo(1);
+            cursor.moveToFirst();
+            int id = cursor.getInt(cursor.getColumnIndex(MediaColumns._ID));
+            String data = cursor.getString(cursor.getColumnIndex(MediaColumns.DATA));
+            Uri uri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id);
+            Log.i(TAG, "Uri: " + uri + ". Data: " + data);
+            return getContentResolver().openFileDescriptor(uri, mode);
+        }
     }
 
     private static ContentResolver getContentResolver() {
@@ -605,178 +1008,5 @@ public class FilePathAccessTest {
     private static void assertInputStreamContent(InputStream in, byte[] expectedContent)
             throws IOException {
         assertThat(ByteStreams.toByteArray(in)).isEqualTo(expectedContent);
-    }
-
-    /**
-     * A functional interface representing an operation that takes no arguments,
-     * returns no arguments and might throw an {@link Exception} of any kind.
-     */
-    @FunctionalInterface
-    private interface Operation<T extends Exception> {
-        /**
-         * This is the method that gets called for any object that implements this interface.
-         */
-        void run() throws T;
-    }
-
-    private static <T extends Exception> void assertThrows(Class<T> clazz, Operation<T> r)
-            throws Exception {
-        assertThrows(clazz, "", r);
-    }
-
-    private static <T extends Exception> void assertThrows(Class<T> clazz, String errMsg,
-            Operation<T> r) throws Exception {
-        try {
-            r.run();
-            fail("Expected " + clazz + " to be thrown");
-        } catch (Exception e) {
-            if (!clazz.isAssignableFrom(e.getClass()) || !e.getMessage().contains(errMsg)) {
-                Log.e(TAG, "Expected " + clazz + " exception with error message: " + errMsg, e);
-                throw e;
-            }
-        }
-    }
-
-    private static String executeShellCommand(String cmd) throws Exception {
-        try (FileInputStream output = new FileInputStream (sUiAutomation.executeShellCommand(cmd)
-                .getFileDescriptor())) {
-            return new String(ByteStreams.toByteArray(output));
-        }
-    }
-
-    private void installApp(TestApp testApp, boolean grantStoragePermission)
-            throws Exception {
-
-        try {
-            final String packageName = testApp.getPackageName();
-            sUiAutomation.adoptShellPermissionIdentity(Manifest.permission.INSTALL_PACKAGES,
-                    Manifest.permission.DELETE_PACKAGES);
-            if (InstallUtils.getInstalledVersion(packageName) != -1) {
-                Uninstall.packages(packageName);
-            }
-            Install.single(testApp).commit();
-            assertThat(InstallUtils.getInstalledVersion(packageName)).isEqualTo(1);
-            if (grantStoragePermission) {
-                grantReadExternalStorage(packageName);
-            }
-        } finally {
-            sUiAutomation.dropShellPermissionIdentity();
-        }
-    }
-
-    private void uninstallApp(TestApp testApp) throws Exception {
-        try {
-            final String packageName = testApp.getPackageName();
-            sUiAutomation.adoptShellPermissionIdentity(Manifest.permission.DELETE_PACKAGES);
-
-            Uninstall.packages(packageName);
-            assertThat(InstallUtils.getInstalledVersion(packageName)).isEqualTo(-1);
-        } finally {
-            sUiAutomation.dropShellPermissionIdentity();
-        }
-    }
-
-    private void grantReadExternalStorage(String packageName) throws Exception {
-        sUiAutomation.adoptShellPermissionIdentity("android.permission.GRANT_RUNTIME_PERMISSIONS");
-        try {
-            sUiAutomation.grantRuntimePermission(packageName,
-                    Manifest.permission.READ_EXTERNAL_STORAGE);
-        } finally {
-            sUiAutomation.dropShellPermissionIdentity();
-        }
-    }
-
-    private void revokeReadExternalStorage(String packageName) throws Exception {
-        sUiAutomation.adoptShellPermissionIdentity("android.permission.REVOKE_RUNTIME_PERMISSIONS");
-        try {
-            sUiAutomation.revokeRuntimePermission(packageName,
-                    Manifest.permission.READ_EXTERNAL_STORAGE);
-        } finally {
-            sUiAutomation.dropShellPermissionIdentity();
-        }
-    }
-
-    private void forceStopApp(String packageName) throws Exception {
-        try {
-            sUiAutomation.adoptShellPermissionIdentity(Manifest.permission.FORCE_STOP_PACKAGES);
-
-            getContext().getSystemService(ActivityManager.class).forceStopPackage(packageName);
-            Thread.sleep(1000);
-        } finally {
-            sUiAutomation.dropShellPermissionIdentity();
-        }
-    }
-
-    private ArrayList<String> listDirectoryEntriesFromTestApp(TestApp testApp, String dirPath)
-            throws Exception {
-        return getContentsFromTestApp(testApp, dirPath, READDIR_QUERY);
-    }
-
-    private boolean createFileFromTestApp(TestApp testApp, String dirPath) throws Exception {
-        return createOrDeleteFileFromTestApp(testApp, dirPath, CREATE_FILE_QUERY);
-    }
-
-    private boolean deleteFileFromTestApp(TestApp testApp, String dirPath) throws Exception {
-        return createOrDeleteFileFromTestApp(testApp, dirPath, DELETE_FILE_QUERY);
-    }
-
-    private void sendIntentToTestApp(TestApp testApp, String dirPath, String actionName,
-            BroadcastReceiver broadcastReceiver, CountDownLatch latch) throws Exception {
-
-        final ArrayList<String> appOutputList = new ArrayList<String>();
-        final String packageName = testApp.getPackageName();
-        forceStopApp(packageName);
-        // Register broadcast receiver
-        final IntentFilter intentFilter = new IntentFilter();
-        intentFilter.addAction(actionName);
-        intentFilter.addCategory(Intent.CATEGORY_DEFAULT);
-        getContext().registerReceiver(broadcastReceiver, intentFilter);
-
-        // Launch the helper app.
-        final Intent intent = new Intent(Intent.ACTION_MAIN);
-        intent.setPackage(packageName);
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        intent.putExtra(QUERY_TYPE, actionName);
-        intent.putExtra(actionName, dirPath);
-        intent.addCategory(Intent.CATEGORY_LAUNCHER);
-        getContext().startActivity(intent);
-        latch.await();
-        getContext().unregisterReceiver(broadcastReceiver);
-    }
-
-    private ArrayList<String> getContentsFromTestApp(TestApp testApp, String dirPath,
-            String actionName) throws Exception {
-        final CountDownLatch latch = new CountDownLatch(1);
-        final ArrayList<String> appOutputList = new ArrayList<String>();
-        final BroadcastReceiver broadcastReceiver = new BroadcastReceiver() {
-            @Override
-            public void onReceive(Context context, Intent intent) {
-                if(intent.hasExtra(actionName)) {
-                    appOutputList.addAll(intent.getStringArrayListExtra(actionName));
-                }
-                latch.countDown();
-            }
-        };
-
-        sendIntentToTestApp(testApp, dirPath, actionName, broadcastReceiver, latch);
-        return appOutputList;
-    }
-
-    private boolean createOrDeleteFileFromTestApp(TestApp testApp, String dirPath, String actionName)
-            throws Exception {
-        final CountDownLatch latch = new CountDownLatch(1);
-        final boolean[] appOutput = new boolean[1];
-        BroadcastReceiver broadcastReceiver = new BroadcastReceiver() {
-            @Override
-            public void onReceive(Context context, Intent intent) {
-                if(intent.hasExtra(actionName)) {
-                    appOutput[0] = intent.getBooleanExtra(actionName, false);
-                }
-                latch.countDown();
-            }
-        };
-
-        sendIntentToTestApp(testApp, dirPath, actionName, broadcastReceiver, latch);
-        return appOutput[0];
     }
 }

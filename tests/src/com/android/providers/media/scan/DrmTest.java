@@ -36,7 +36,7 @@ import androidx.annotation.Nullable;
 import androidx.test.InstrumentationRegistry;
 import androidx.test.runner.AndroidJUnit4;
 
-import com.android.providers.media.tests.R;
+import com.android.providers.media.R;
 import com.android.providers.media.util.DatabaseUtils;
 import com.android.providers.media.util.FileUtils;
 
@@ -141,7 +141,7 @@ public class DrmTest {
         flFile.close();
 
         // Scan the DRM file and confirm that it looks sane
-        final Uri flUri = MediaStore.scanFile(mContext, flPath);
+        final Uri flUri = MediaStore.scanFile(mContext.getContentResolver(), flPath);
         try (Cursor c = mContext.getContentResolver().query(flUri, null, null, null)) {
             assertTrue(c.moveToFirst());
 

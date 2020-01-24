@@ -37,6 +37,7 @@ import org.junit.runner.RunWith;
 import java.io.File;
 import java.io.FileDescriptor;
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -77,15 +78,16 @@ public class LegacyFileAccessTest {
                 "LegacyFileAccessTest");
         assertCanCreateFile(file);
 
-        // Can even create another app's external storage dir
+        // However, even legacy apps can't create files under other app's directories
         final File otherAppDir = new File(Environment.getExternalStorageDirectory(),
                 "Android/data/com.android.shell");
         file = new File(otherAppDir, "LegacyFileAccessTest.txt");
+
+        // otherAppDir was already created by the host test
         try {
-            otherAppDir.mkdir();
-            assertCanCreateFile(file);
-        } finally {
-            otherAppDir.delete();
+            file.createNewFile();
+            fail("File creation expected to fail: " + file);
+        } catch (IOException expected) {
         }
     }
 
@@ -105,14 +107,10 @@ public class LegacyFileAccessTest {
         final File otherAppDir = new File(Environment.getExternalStorageDirectory(),
                 "Android/data/com.android.shell");
 
-        // Can create a directory under another app's private directory
+        // However, even legacy apps can't create dirs under other app's directories
         final File subDir = new File(otherAppDir, "LegacyFileAccessTest");
-        try {
-            otherAppDir.mkdir();
-            assertCanCreateDir(subDir);
-        } finally {
-            otherAppDir.delete();
-        }
+        // otherAppDir was already created by the host test
+        assertThat(subDir.mkdir()).isFalse();
 
         // Try to list a directory and fail because it requires READ permission
         assertThat(new File(Environment.getExternalStorageDirectory(),
@@ -164,11 +162,29 @@ public class LegacyFileAccessTest {
         // try to list a directory and fail
         assertThat(new File(Environment.getExternalStorageDirectory(),
                 Environment.DIRECTORY_MUSIC).list()).isNull();
+        assertThat(Environment.getExternalStorageDirectory().list()).isNull();
 
         // However, even without permissions, we can access our own external dir
         file = new File(InstrumentationRegistry.getContext().getExternalFilesDir(null),
                 "LegacyFileAccessTest");
-        assertCanCreateFile(file);
+        try {
+            assertThat(file.createNewFile()).isTrue();
+            assertThat(Arrays.asList(file.getParentFile().list()))
+                    .containsExactly("LegacyFileAccessTest");
+        } finally {
+            file.delete();
+        }
+
+        // we can access our own external media directory without permissions.
+        file = new File(InstrumentationRegistry.getContext().getExternalMediaDirs()[0],
+                "LegacyFileAccessTest");
+        try {
+            assertThat(file.createNewFile()).isTrue();
+            assertThat(Arrays.asList(file.getParentFile().list()))
+                    .containsExactly("LegacyFileAccessTest");
+        } finally {
+            file.delete();
+        }
     }
 
     // test read storage permission
@@ -212,6 +228,19 @@ public class LegacyFileAccessTest {
         // try to mkdir and fail, because it requires WRITE
         assertThat(new File(Environment.getExternalStorageDirectory(), "/LegacyFileAccessTest")
                 .mkdir()).isFalse();
+    }
+
+    /*
+     * Test that legacy app with storage permission can list all files
+     */
+    @Test
+    public void testListFiles_hasR() throws Exception {
+        pollForPermission(Manifest.permission.READ_EXTERNAL_STORAGE, /*granted*/ true);
+        pollForPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE, /*granted*/ false);
+
+        // can list a non-media file created by other package.
+        assertThat(Arrays.asList(Environment.getExternalStorageDirectory().list()))
+                .contains("LegacyAccessHostTest_shell");
     }
 
     private static void assertCanCreateFile(File file) throws IOException {

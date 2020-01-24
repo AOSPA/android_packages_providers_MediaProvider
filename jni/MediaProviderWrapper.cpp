@@ -157,63 +157,68 @@ int isDirectoryOperationAllowedInternal(JNIEnv* env, jobject media_provider_obje
     return res;
 }
 
-std::vector<std::shared_ptr<DirectoryEntry>> getDirectoryEntriesInternal(
-        JNIEnv* env, jobject media_provider_object, jmethodID mid_get_directory_entries, uid_t uid,
-        const string& path, DIR* dirp) {
-    LOG(DEBUG) << "Getting directory entries for UID = " << uid << ". Path = " << path;
+std::vector<std::shared_ptr<DirectoryEntry>> getFilesInDirectoryInternal(
+        JNIEnv* env, jobject media_provider_object, jmethodID mid_get_files_in_dir, uid_t uid,
+        const string& path) {
+    LOG(DEBUG) << "Getting file names in path " << path << " for UID = " << uid;
     std::vector<std::shared_ptr<DirectoryEntry>> directory_entries;
     ScopedLocalRef<jstring> j_path(env, env->NewStringUTF(path.c_str()));
 
-    ScopedLocalRef<jobjectArray> directory_entry_list(
+    ScopedLocalRef<jobjectArray> files_list(
             env, static_cast<jobjectArray>(env->CallObjectMethod(
-                         media_provider_object, mid_get_directory_entries, j_path.get(), uid)));
+                         media_provider_object, mid_get_files_in_dir, j_path.get(), uid)));
 
     if (CheckForJniException(env)) {
-        LOG(ERROR) << "Exception occurred while calling MediaProvider#getDirectoryEntries";
-        directory_entries.push_back(std::make_shared<DirectoryEntry>("", EBADF));
+        LOG(ERROR) << "Exception occurred while calling MediaProvider#getFilesInDirectoryForFuse";
+        directory_entries.push_back(std::make_shared<DirectoryEntry>("", EFAULT));
         return directory_entries;
     }
 
-    int de_count = env->GetArrayLength(directory_entry_list.get());
-    // directory_entry_list is a list of strings with directory entry names.
-    // First part of the list contains files and second part has directories.
-    // "" separates the first part of this list from second.
-    // A list with only '/' indicates that directory path is not indexed by MediaProvider
-    // database and directory entries should be obtained from lower file system.
+    int de_count = env->GetArrayLength(files_list.get());
     if (de_count == 1) {
-        ScopedLocalRef<jstring> j_d_name(
-                env, (jstring)env->GetObjectArrayElement(directory_entry_list.get(), 0));
+        ScopedLocalRef<jstring> j_d_name(env,
+                                         (jstring)env->GetObjectArrayElement(files_list.get(), 0));
         ScopedUtfChars d_name(env, j_d_name.get());
         if (d_name.c_str() == nullptr) {
-            LOG(ERROR) << "Error reading directory entry from MediaProvider at index 0";
-            directory_entries.insert(directory_entries.begin(),
-                                     std::make_shared<DirectoryEntry>("", EBADF));
+            LOG(ERROR) << "Error reading file name returned from MediaProvider at index " << 0;
+            directory_entries.push_back(std::make_shared<DirectoryEntry>("", EFAULT));
             return directory_entries;
-        } else if (d_name.c_str()[0] == '/') {
-            return getDirectoryEntriesFromLowerFs(dirp);
+        } else if (d_name.c_str()[0] == '\0') {
+            // Calling package has no storage permissions.
+            directory_entries.push_back(std::make_shared<DirectoryEntry>("", EPERM));
+            return directory_entries;
         }
     }
 
-    int type = DT_REG;
     for (int i = 0; i < de_count; i++) {
-        ScopedLocalRef<jstring> j_d_name(
-                env, (jstring)env->GetObjectArrayElement(directory_entry_list.get(), i));
+        ScopedLocalRef<jstring> j_d_name(env,
+                                         (jstring)env->GetObjectArrayElement(files_list.get(), i));
         ScopedUtfChars d_name(env, j_d_name.get());
 
         if (d_name.c_str() == nullptr) {
-            LOG(ERROR) << "Error reading directory entry from MediaProvider at index " << i;
+            LOG(ERROR) << "Error reading file name returned from MediaProvider at index " << i;
             directory_entries.resize(0);
-            directory_entries.insert(directory_entries.begin(),
-                                     std::make_shared<DirectoryEntry>("", EBADF));
+            directory_entries.push_back(std::make_shared<DirectoryEntry>("", EFAULT));
             break;
-        } else if (d_name.c_str()[0] == '\0') {
-            // Separator found, next directory entries are directories.
-            type = DT_DIR;
-            continue;
         }
-        directory_entries.push_back(std::make_shared<DirectoryEntry>(d_name.c_str(), type));
+        directory_entries.push_back(std::make_shared<DirectoryEntry>(d_name.c_str(), DT_REG));
     }
     return directory_entries;
+}
+
+int renameInternal(JNIEnv* env, jobject media_provider_object, jmethodID mid_rename,
+                   const string& old_path, const string& new_path, uid_t uid) {
+    LOG(DEBUG) << "Renaming " << old_path << " to " << new_path << ", uid: " << uid;
+    ScopedLocalRef<jstring> j_old_path(env, env->NewStringUTF(old_path.c_str()));
+    ScopedLocalRef<jstring> j_new_path(env, env->NewStringUTF(new_path.c_str()));
+    int res = env->CallIntMethod(media_provider_object, mid_rename, j_old_path.get(),
+                                 j_new_path.get(), uid);
+    if (CheckForJniException(env)) {
+        LOG(DEBUG) << "Java exception occurred while renaming a file or directory";
+        return -EFAULT;
+    }
+    LOG(DEBUG) << "res = " << res;
+    return res;
 }
 }  // namespace
 /*****************************************************************************************/
@@ -250,9 +255,11 @@ MediaProviderWrapper::MediaProviderWrapper(JNIEnv* env, jobject media_provider) 
                                          "(Ljava/lang/String;I)I", /*is_static*/ false);
     mid_is_opendir_allowed_ = CacheMethod(env, "isOpendirAllowed", "(Ljava/lang/String;I)I",
                                           /*is_static*/ false);
-    mid_get_directory_entries_ =
-            CacheMethod(env, "getDirectoryEntries", "(Ljava/lang/String;I)[Ljava/lang/String;",
+    mid_get_files_in_dir_ =
+            CacheMethod(env, "getFilesInDirectory", "(Ljava/lang/String;I)[Ljava/lang/String;",
                         /*is_static*/ false);
+    mid_rename_ = CacheMethod(env, "rename", "(Ljava/lang/String;Ljava/lang/String;I)I",
+                              /*is_static*/ false);
 
     jni_tasks_welcome_ = true;
     request_terminate_jni_thread_ = false;
@@ -295,9 +302,6 @@ std::unique_ptr<RedactionInfo> MediaProviderWrapper::GetRedactionInfo(const stri
     // Default value in case JNI thread was being terminated, causes the read to fail.
     std::unique_ptr<RedactionInfo> res = nullptr;
 
-    // TODO: Consider what to do if task doesn't get posted. This could happen
-    // if MediaProviderWrapper's d'tor was called and before it's done, a thread slipped in
-    // and requested to read a file.
     PostAndWaitForTask([this, uid, &path, &res](JNIEnv* env) {
         auto ri = getRedactionInfoInternal(env, media_provider_object_, mid_get_redaction_ranges_,
                                            uid, path);
@@ -392,17 +396,27 @@ int MediaProviderWrapper::IsDeletingDirAllowed(const string& path, uid_t uid) {
 
 std::vector<std::shared_ptr<DirectoryEntry>> MediaProviderWrapper::GetDirectoryEntries(
         uid_t uid, const string& path, DIR* dirp) {
-    if (shouldBypassMediaProvider(uid)) {
-        return getDirectoryEntriesFromLowerFs(dirp);
-    }
-
     // Default value in case JNI thread was being terminated
     std::vector<std::shared_ptr<DirectoryEntry>> res;
-    PostAndWaitForTask([this, uid, path, dirp, &res](JNIEnv* env) {
-        res = getDirectoryEntriesInternal(env, media_provider_object_, mid_get_directory_entries_,
-                                          uid, path, dirp);
+    if (shouldBypassMediaProvider(uid)) {
+        addDirectoryEntriesFromLowerFs(dirp, /* filter */ nullptr, &res);
+        return res;
+    }
+
+    PostAndWaitForTask([this, uid, path, &res](JNIEnv* env) {
+        res = getFilesInDirectoryInternal(env, media_provider_object_, mid_get_files_in_dir_, uid,
+                                          path);
     });
 
+    const int res_size = res.size();
+    if (res_size && res[0]->d_name[0] == '/') {
+        // Path is unknown to MediaProvider, get files and directories from lower file system.
+        res.resize(0);
+        addDirectoryEntriesFromLowerFs(dirp, /* filter */ nullptr, &res);
+    } else if (res_size == 0 || !res[0]->d_name.empty()) {
+        // add directory names from lower file system.
+        addDirectoryEntriesFromLowerFs(dirp, /* filter */ &isDirectory, &res);
+    }
     return res;
 }
 
@@ -419,6 +433,20 @@ int MediaProviderWrapper::IsOpendirAllowed(const string& path, uid_t uid) {
                                                   mid_is_opendir_allowed_, path, uid);
     });
 
+    return res;
+}
+
+int MediaProviderWrapper::Rename(const string& old_path, const string& new_path, uid_t uid) {
+    int res = -EIO;  // Default value in case JNI thread was being terminated
+    if (shouldBypassMediaProvider(uid)) {
+        res = rename(old_path.c_str(), new_path.c_str());
+        if (res != 0) res = -errno;
+        return res;
+    }
+
+    PostAndWaitForTask([this, old_path, new_path, uid, &res](JNIEnv* env) {
+        res = renameInternal(env, media_provider_object_, mid_rename_, old_path, new_path, uid);
+    });
     return res;
 }
 
@@ -491,10 +519,12 @@ void MediaProviderWrapper::JniThreadLoop(JavaVM* jvm) {
 jmethodID MediaProviderWrapper::CacheMethod(JNIEnv* env, const char method_name[],
                                             const char signature[], bool is_static) {
     jmethodID mid;
+    string actual_method_name(method_name);
+    actual_method_name.append("ForFuse");
     if (is_static) {
-        mid = env->GetStaticMethodID(media_provider_class_, method_name, signature);
+        mid = env->GetStaticMethodID(media_provider_class_, actual_method_name.c_str(), signature);
     } else {
-        mid = env->GetMethodID(media_provider_class_, method_name, signature);
+        mid = env->GetMethodID(media_provider_class_, actual_method_name.c_str(), signature);
     }
     if (!mid) {
         // SHOULD NOT HAPPEN!

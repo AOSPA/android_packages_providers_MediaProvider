@@ -53,10 +53,10 @@ class MediaProviderWrapper final {
     ~MediaProviderWrapper();
 
     /**
-     * Computes and returns the RedactionInfo for a given FD and UID.
+     * Computes and returns the RedactionInfo for a given file and UID.
      *
      * @param uid UID of the app requesting the read
-     * @param fd FD of the requested file
+     * @param path path of the requested file
      * @return RedactionInfo on success, nullptr on failure to calculate
      * redaction ranges (e.g. exception was thrown in Java world)
      */
@@ -82,14 +82,15 @@ class MediaProviderWrapper final {
     int DeleteFile(const std::string& path, uid_t uid);
 
     /**
-     * Gets directory entries for given relative path from MediaProvider database.
+     * Gets directory entries for given path from MediaProvider database and lower file system
      *
      * @param uid UID of the calling app.
      * @param path Relative path of the directory.
      * @param dirp Pointer to directory stream, used to query lower file system.
-     * @return DirectoryEntries with list of directory entries on success,
-     * DirectoryEntries with an empty list if directory path is unknown to MediaProvider
-     * or no directory entries are visible to the calling app.
+     * @return DirectoryEntries with list of directory entries on success.
+     * File names in a directory are obtained from MediaProvider. If a path is unknown to
+     * MediaProvider, file names are obtained from lower file system. All directory names in the
+     * given directory are obtained from lower file system.
      * An empty string in first directory entry name indicates the error occurred while obtaining
      * directory entries, directory entry type will hold the corresponding errno information.
      */
@@ -142,6 +143,18 @@ class MediaProviderWrapper final {
      */
     int IsOpendirAllowed(const std::string& path, uid_t uid);
 
+    /**
+     * Renames a file or directory to new path.
+     *
+     * @param old_path path of the file or directory to be renamed.
+     * @param new_path new path of the file or directory to be renamed.
+     * @param uid UID of the calling app.
+     * @return 0 if rename is successful, negated errno if one of the rename fails. If return
+     * value is 0, it's guaranteed that file/directory is moved to new_path. For any other errno
+     * except EFAULT/EIO, it's guaranteed that file/directory is not renamed.
+     */
+    int Rename(const std::string& old_path, const std::string& new_path, uid_t uid);
+
   private:
     jclass media_provider_class_;
     jobject media_provider_object_;
@@ -153,7 +166,9 @@ class MediaProviderWrapper final {
     jmethodID mid_scan_file_;
     jmethodID mid_is_dir_op_allowed_;
     jmethodID mid_is_opendir_allowed_;
-    jmethodID mid_get_directory_entries_;
+    jmethodID mid_get_files_in_dir_;
+    jmethodID mid_rename_;
+
     /**
      * All JNI calls are delegated to this thread
      */

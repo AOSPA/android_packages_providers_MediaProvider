@@ -45,7 +45,7 @@ import androidx.test.InstrumentationRegistry;
 import androidx.test.runner.AndroidJUnit4;
 
 import com.android.providers.media.scan.MediaScannerTest.IsolatedContext;
-import com.android.providers.media.tests.R;
+import com.android.providers.media.R;
 import com.android.providers.media.util.FileUtils;
 
 import org.junit.After;
@@ -69,11 +69,12 @@ public class ModernMediaScannerTest {
 
     @Before
     public void setUp() {
-        mDir = new File(Environment.getExternalStorageDirectory(), "test_" + System.nanoTime());
+        final Context context = InstrumentationRegistry.getTargetContext();
+
+        mDir = new File(context.getExternalMediaDirs()[0], "test_" + System.nanoTime());
         mDir.mkdirs();
         FileUtils.deleteContents(mDir);
 
-        final Context context = InstrumentationRegistry.getTargetContext();
         mIsolatedContext = new IsolatedContext(context, "modern");
         mIsolatedResolver = mIsolatedContext.getContentResolver();
 
@@ -251,7 +252,8 @@ public class ModernMediaScannerTest {
         // We should see a new playlist with all three items as members
         final long playlistId;
         try (Cursor cursor = mIsolatedContext.getContentResolver().query(
-                MediaStore.Files.EXTERNAL_CONTENT_URI, new String[] { FileColumns._ID },
+                MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL),
+                new String[] { FileColumns._ID },
                 FileColumns.MEDIA_TYPE + "=" + FileColumns.MEDIA_TYPE_PLAYLIST, null, null)) {
             assertTrue(cursor.moveToFirst());
             playlistId = cursor.getLong(0);
@@ -315,7 +317,7 @@ public class ModernMediaScannerTest {
         }
 
         // Make sure out pending scan has finished
-        MediaStore.waitForIdle(mIsolatedContext);
+        MediaStore.waitForIdle(mIsolatedResolver);
 
         try (Cursor cursor = mIsolatedResolver
                 .query(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, null, null, null, null)) {

@@ -16,10 +16,8 @@
 
 package com.android.providers.media;
 
-import static android.provider.MediaStore.Downloads.isDownload;
-import static android.provider.MediaStore.Downloads.isDownloadDir;
-
-import static com.android.providers.media.MediaProvider.extractPathOwnerPackageName;
+import static com.android.providers.media.util.FileUtils.isDownload;
+import static com.android.providers.media.util.FileUtils.isDownloadDir;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
@@ -48,7 +46,9 @@ import androidx.test.runner.AndroidJUnit4;
 
 import com.android.providers.media.MediaProvider.VolumeArgumentException;
 import com.android.providers.media.scan.MediaScannerTest.IsolatedContext;
+import com.android.providers.media.util.FileUtils;
 
+import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
@@ -146,7 +146,7 @@ public class MediaProviderTest {
     }
 
     private static String getPathOwnerPackageName(String path) {
-        return extractPathOwnerPackageName(path);
+        return FileUtils.extractPathOwnerPackageName(path);
     }
 
     @Test
@@ -200,6 +200,7 @@ public class MediaProviderTest {
     }
 
     @Test
+    @Ignore("Enable as part of b/142561358")
     public void testBuildData_Secondary() throws Exception {
         final Uri uri = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
         assertEndsWith("/Pictures/Screenshots/foo.png",
@@ -242,6 +243,7 @@ public class MediaProviderTest {
     }
 
     @Test
+    @Ignore("Enable as part of b/142561358")
     public void testBuildData_Charset() throws Exception {
         final Uri uri = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
         assertEndsWith("/Pictures/foo__bar/bar__baz.png",
@@ -452,7 +454,6 @@ public class MediaProviderTest {
             final ContentValues values = computeDataValues(data);
             assertVolume(values, "0000-0000");
             assertBucket(values, "/storage/0000-0000/DCIM/Camera", "Camera");
-            assertGroup(values, "IMG1024");
             assertRelativePath(values, "DCIM/Camera/");
         }
     }
@@ -464,13 +465,11 @@ public class MediaProviderTest {
         values = computeDataValues("/storage/0000-0000/DCIM/Camera/IMG1024");
         assertVolume(values, "0000-0000");
         assertBucket(values, "/storage/0000-0000/DCIM/Camera", "Camera");
-        assertGroup(values, null);
         assertRelativePath(values, "DCIM/Camera/");
 
         values = computeDataValues("/storage/0000-0000/DCIM/Camera/.foo");
         assertVolume(values, "0000-0000");
         assertBucket(values, "/storage/0000-0000/DCIM/Camera", "Camera");
-        assertGroup(values, null);
         assertRelativePath(values, "DCIM/Camera/");
     }
 
@@ -497,25 +496,21 @@ public class MediaProviderTest {
             values = computeDataValues(top + "/IMG1024.JPG");
             assertVolume(values, MediaStore.VOLUME_EXTERNAL_PRIMARY);
             assertBucket(values, top, null);
-            assertGroup(values, "IMG1024");
             assertRelativePath(values, "/");
 
             values = computeDataValues(top + "/One/IMG1024.JPG");
             assertVolume(values, MediaStore.VOLUME_EXTERNAL_PRIMARY);
             assertBucket(values, top + "/One", "One");
-            assertGroup(values, "IMG1024");
             assertRelativePath(values, "One/");
 
             values = computeDataValues(top + "/One/Two/IMG1024.JPG");
             assertVolume(values, MediaStore.VOLUME_EXTERNAL_PRIMARY);
             assertBucket(values, top + "/One/Two", "Two");
-            assertGroup(values, "IMG1024");
             assertRelativePath(values, "One/Two/");
 
             values = computeDataValues(top + "/One/Two/Three/IMG1024.JPG");
             assertVolume(values, MediaStore.VOLUME_EXTERNAL_PRIMARY);
             assertBucket(values, top + "/One/Two/Three", "Three");
-            assertGroup(values, "IMG1024");
             assertRelativePath(values, "One/Two/Three/");
         }
     }
@@ -528,28 +523,28 @@ public class MediaProviderTest {
             "IMG1024.JPG",
             "storage/emulated/",
         }) {
-            assertEquals(MediaProvider.extractRelativePathForDirectory(data), null);
+            assertEquals(FileUtils.extractRelativePathForDirectory(data), null);
         }
     }
 
     @Test
     public void testRelativePathForValidDirectories() throws Exception {
         for (Pair<String, String> top: new ArrayList<Pair<String, String>>() {{
-            add(new Pair("/storage/emulated/0", new String("")));
+            add(new Pair("/storage/emulated/0", new String("/")));
             add(new Pair("/storage/emulated/0/DCIM", "DCIM/"));
             add(new Pair("/storage/emulated/0/DCIM/Camera", "DCIM/Camera/"));
             add(new Pair("/storage/emulated/0/Android/media/com.example/Foo",
                     "Android/media/com.example/Foo/"));
             add(new Pair("/storage/0000-0000/DCIM/Camera", "DCIM/Camera/"));
         }}) {
-            assertEquals(top.second, MediaProvider.extractRelativePathForDirectory(top.first));
+            assertEquals(top.second, FileUtils.extractRelativePathForDirectory(top.first));
         }
     }
 
     private static ContentValues computeDataValues(String path) {
         final ContentValues values = new ContentValues();
         values.put(MediaColumns.DATA, path);
-        MediaProvider.computeDataValues(values);
+        FileUtils.computeDataValues(values);
         Log.v(TAG, "Computed values " + values);
         return values;
     }
@@ -563,15 +558,6 @@ public class MediaProviderTest {
         } else {
             assertNull(values.get(ImageColumns.BUCKET_DISPLAY_NAME));
             assertNull(values.get(ImageColumns.BUCKET_ID));
-        }
-    }
-
-    private static void assertGroup(ContentValues values, String groupId) {
-        if (groupId != null) {
-            assertEquals(groupId.toLowerCase(Locale.ROOT).hashCode(),
-                    (long) values.getAsLong(ImageColumns.GROUP_ID));
-        } else {
-            assertNull(values.get(ImageColumns.GROUP_ID));
         }
     }
 
