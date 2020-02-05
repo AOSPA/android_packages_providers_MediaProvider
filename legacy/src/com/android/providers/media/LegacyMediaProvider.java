@@ -31,8 +31,12 @@ import android.provider.MediaStore.MediaColumns;
 
 import androidx.annotation.NonNull;
 
+import com.android.providers.media.util.Logging;
+
 import java.io.File;
+import java.io.FileDescriptor;
 import java.io.IOException;
+import java.io.PrintWriter;
 
 /**
  * Very limited subset of {@link MediaProvider} which only surfaces
@@ -60,10 +64,13 @@ public class LegacyMediaProvider extends ContentProvider {
     public boolean onCreate() {
         final Context context = getContext();
 
+        final File persistentDir = context.getDir("logs", Context.MODE_PRIVATE);
+        Logging.initPersistent(persistentDir);
+
         mInternalDatabase = new DatabaseHelper(context, INTERNAL_DATABASE_NAME,
-                true, false, true, null, null);
+                true, false, true, null, null, null);
         mExternalDatabase = new DatabaseHelper(context, EXTERNAL_DATABASE_NAME,
-                false, false, true, null, null);
+                false, false, true, null, null, null);
 
         return true;
     }
@@ -94,7 +101,9 @@ public class LegacyMediaProvider extends ContentProvider {
     @Override
     public Uri insert(Uri uri, ContentValues values) {
         try {
-            new File(values.getAsString(MediaColumns.DATA)).createNewFile();
+            final File file = new File(values.getAsString(MediaColumns.DATA));
+            file.getParentFile().mkdirs();
+            file.createNewFile();
         } catch (IOException e) {
             throw new IllegalStateException(e);
         }
@@ -112,5 +121,10 @@ public class LegacyMediaProvider extends ContentProvider {
     @Override
     public int update(Uri uri, ContentValues values, String selection, String[] selectionArgs) {
         throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public void dump(FileDescriptor fd, PrintWriter writer, String[] args) {
+        Logging.dumpPersistent(writer);
     }
 }

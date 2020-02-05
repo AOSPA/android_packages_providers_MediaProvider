@@ -35,7 +35,6 @@ import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.media.ExifInterface;
 import android.net.Uri;
-import android.os.Environment;
 import android.os.ParcelFileDescriptor;
 import android.provider.MediaStore;
 import android.provider.MediaStore.Files.FileColumns;
@@ -44,8 +43,8 @@ import android.provider.MediaStore.MediaColumns;
 import androidx.test.InstrumentationRegistry;
 import androidx.test.runner.AndroidJUnit4;
 
-import com.android.providers.media.scan.MediaScannerTest.IsolatedContext;
 import com.android.providers.media.R;
+import com.android.providers.media.scan.MediaScannerTest.IsolatedContext;
 import com.android.providers.media.util.FileUtils;
 
 import org.junit.After;
@@ -84,6 +83,11 @@ public class ModernMediaScannerTest {
     @After
     public void tearDown() {
         FileUtils.deleteContents(mDir);
+    }
+
+    @Test
+    public void testSimple() throws Exception {
+        assertNotNull(mModern.getContext());
     }
 
     @Test
@@ -290,6 +294,36 @@ public class ModernMediaScannerTest {
     }
 
     @Test
+    public void testFilter() throws Exception {
+        final File music = new File(mDir, "Music");
+        music.mkdirs();
+        stage(R.raw.test_audio, new File(music, "example.mp3"));
+        mModern.scanDirectory(mDir, REASON_UNKNOWN);
+
+        // Exact matches
+        assertQueryCount(1, MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+                .buildUpon().appendQueryParameter("filter", "artist").build());
+        assertQueryCount(1, MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+                .buildUpon().appendQueryParameter("filter", "album").build());
+        assertQueryCount(1, MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+                .buildUpon().appendQueryParameter("filter", "title").build());
+
+        // Partial matches mid-string
+        assertQueryCount(1, MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+                .buildUpon().appendQueryParameter("filter", "ArT").build());
+
+        // Filter should only apply to narrow collection type
+        assertQueryCount(0, MediaStore.Audio.Albums.EXTERNAL_CONTENT_URI
+                .buildUpon().appendQueryParameter("filter", "title").build());
+
+        // Other unrelated search terms
+        assertQueryCount(0, MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+                .buildUpon().appendQueryParameter("filter", "example").build());
+        assertQueryCount(0, MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+                .buildUpon().appendQueryParameter("filter", "チ").build());
+    }
+
+    @Test
     public void testScan_Common() throws Exception {
         final File file = new File(mDir, "red.jpg");
         stage(R.raw.test_image, file);
@@ -380,6 +414,29 @@ public class ModernMediaScannerTest {
         nomedia.createNewFile();
         assertNull(mModern.scanFile(image, REASON_UNKNOWN));
         assertQueryCount(0, MediaStore.Images.Media.EXTERNAL_CONTENT_URI);
+    }
+
+    /**
+     * Verify fix for obscure bug which would cause us to delete files outside a
+     * directory that share a common prefix.
+     */
+    @Test
+    public void testScan_Prefix() throws Exception {
+        final File dir = new File(mDir, "test");
+        final File inside = new File(dir, "testfile.jpg");
+        final File outside = new File(mDir, "testfile.jpg");
+
+        dir.mkdirs();
+        inside.createNewFile();
+        outside.createNewFile();
+
+        // Scanning from top means we get both items
+        mModern.scanDirectory(mDir, REASON_UNKNOWN);
+        assertQueryCount(2, MediaStore.Images.Media.EXTERNAL_CONTENT_URI);
+
+        // Scanning from middle means we still have both items
+        mModern.scanDirectory(dir, REASON_UNKNOWN);
+        assertQueryCount(2, MediaStore.Images.Media.EXTERNAL_CONTENT_URI);
     }
 
     private void assertQueryCount(int expected, Uri actualUri) {

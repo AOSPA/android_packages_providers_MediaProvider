@@ -155,12 +155,37 @@ public class FuseDaemonHostTest extends BaseHostJUnit4Test {
     }
 
     @Test
+    public void testRenameFileType() throws Exception {
+        runDeviceTest("testRenameFileType");
+    }
+
+    @Test
+    public void testRenameAndReplaceFile() throws Exception {
+        runDeviceTest("testRenameAndReplaceFile");
+    }
+
+    @Test
+    public void testRenameFileNotOwned() throws Exception {
+        runDeviceTest("testRenameFileNotOwned");
+    }
+
+    @Test
     public void testRenameDirectory() throws Exception {
         runDeviceTest("testRenameDirectory");
     }
 
     @Test
+    public void testRenameDirectoryNotOwned() throws Exception {
+        runDeviceTest("testRenameDirectoryNotOwned");
+    }
+
+    @Test
     public void testRenameEmptyDirectory() throws Exception {
         runDeviceTest("testRenameEmptyDirectory");
+    }
+
+    @Test
+    public void testManageExternalStorageBypassesMediaProviderRestrictions() throws Exception {
+        runDeviceTest("testManageExternalStorageBypassesMediaProviderRestrictions");
     }
 }

@@ -34,9 +34,7 @@ android_app {
         "java_api_finder",
     ],
 
-    // STOPSHIP: remove this when building against system_current
-    platform_apis: true,
-    // sdk_version: "system_current",
+    sdk_version: "system_current",
 
     certificate: "media",
     privileged: true,
@@ -70,6 +68,7 @@ filegroup {
         "src/com/android/providers/media/util/FileUtils.java",
         "src/com/android/providers/media/util/HandlerExecutor.java",
         "src/com/android/providers/media/util/Logging.java",
+        "src/com/android/providers/media/util/MimeUtils.java",
     ],
 }
 

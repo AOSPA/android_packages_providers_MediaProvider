@@ -36,11 +36,13 @@ import static com.android.providers.media.util.Logging.TAG;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.database.Cursor;
-import android.database.sqlite.SQLiteQueryBuilder;
+import android.database.SQLException;
+import android.database.sqlite.SQLiteDatabase;
+import android.database.sqlite.SQLiteStatement;
 import android.net.Uri;
 import android.os.Bundle;
-import android.provider.MediaStore;
 import android.text.TextUtils;
+import android.util.ArrayMap;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
@@ -433,5 +435,91 @@ public class DatabaseUtils {
             queryArgs.putString(QUERY_ARG_SQL_SORT_ORDER, sortOrder);
         }
         return queryArgs;
+    }
+
+    public static @NonNull ArrayMap<String, Object> getValues(@NonNull ContentValues values) {
+        final ArrayMap<String, Object> res = new ArrayMap<>();
+        for (String key : values.keySet()) {
+            res.put(key, values.get(key));
+        }
+        return res;
+    }
+
+    public static long executeInsert(@NonNull SQLiteDatabase db, @NonNull String sql,
+            @Nullable Object[] bindArgs) throws SQLException {
+        try (SQLiteStatement st = db.compileStatement(sql)) {
+            bindArgs(st, bindArgs);
+            return st.executeInsert();
+        }
+    }
+
+    public static int executeUpdateDelete(@NonNull SQLiteDatabase db, @NonNull String sql,
+            @Nullable Object[] bindArgs) throws SQLException {
+        try (SQLiteStatement st = db.compileStatement(sql)) {
+            bindArgs(st, bindArgs);
+            return st.executeUpdateDelete();
+        }
+    }
+
+    private static void bindArgs(@NonNull SQLiteStatement st, @Nullable Object[] bindArgs) {
+        if (bindArgs == null) return;
+
+        for (int i = 0; i < bindArgs.length; i++) {
+            final Object bindArg = bindArgs[i];
+            switch (getTypeOfObject(bindArg)) {
+                case Cursor.FIELD_TYPE_NULL:
+                    st.bindNull(i + 1);
+                    break;
+                case Cursor.FIELD_TYPE_INTEGER:
+                    st.bindLong(i + 1, ((Number) bindArg).longValue());
+                    break;
+                case Cursor.FIELD_TYPE_FLOAT:
+                    st.bindDouble(i + 1, ((Number) bindArg).doubleValue());
+                    break;
+                case Cursor.FIELD_TYPE_BLOB:
+                    st.bindBlob(i + 1, (byte[]) bindArg);
+                    break;
+                case Cursor.FIELD_TYPE_STRING:
+                default:
+                    if (bindArg instanceof Boolean) {
+                        // Provide compatibility with legacy
+                        // applications which may pass Boolean values in
+                        // bind args.
+                        st.bindLong(i + 1, ((Boolean) bindArg).booleanValue() ? 1 : 0);
+                    } else {
+                        st.bindString(i + 1, bindArg.toString());
+                    }
+                    break;
+            }
+        }
+    }
+
+    public static @NonNull String bindList(@NonNull Object... args) {
+        final StringBuilder sb = new StringBuilder();
+        sb.append('(');
+        for (int i = 0; i < args.length; i++) {
+            sb.append('?');
+            if (i < args.length - 1) {
+                sb.append(',');
+            }
+        }
+        sb.append(')');
+        return DatabaseUtils.bindSelection(sb.toString(), args);
+    }
+
+    /**
+     * Escape the given argument for use in a {@code LIKE} statement.
+     */
+    public static String escapeForLike(@NonNull String arg) {
+        final StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < arg.length(); i++) {
+            final char c = arg.charAt(i);
+            switch (c) {
+                case '%': sb.append('\\');
+                case '_': sb.append('\\');
+            }
+            sb.append(c);
+        }
+        return sb.toString();
     }
 }

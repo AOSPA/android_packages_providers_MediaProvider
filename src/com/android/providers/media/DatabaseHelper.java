@@ -16,6 +16,7 @@
 
 package com.android.providers.media;
 
+import static com.android.providers.media.util.DatabaseUtils.bindList;
 import static com.android.providers.media.util.Logging.LOGV;
 import static com.android.providers.media.util.Logging.TAG;
 
@@ -47,18 +48,20 @@ import android.provider.MediaStore.Video;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.system.OsConstants;
-import android.text.format.DateUtils;
 import android.util.ArrayMap;
 import android.util.ArraySet;
 import android.util.Log;
 
 import androidx.annotation.GuardedBy;
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import androidx.annotation.VisibleForTesting;
 
 import com.android.providers.media.util.BackgroundThread;
 import com.android.providers.media.util.DatabaseUtils;
 import com.android.providers.media.util.FileUtils;
+import com.android.providers.media.util.Logging;
+import com.android.providers.media.util.MimeUtils;
 
 import java.io.File;
 import java.io.FilenameFilter;
@@ -67,7 +70,9 @@ import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
+import java.util.function.LongSupplier;
 import java.util.regex.Matcher;
 
 /**
@@ -76,15 +81,15 @@ import java.util.regex.Matcher;
  * on demand, create and upgrade the schema, etc.
  */
 public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
-    // maximum number of cached external databases to keep
-    private static final int MAX_EXTERNAL_DATABASES = 3;
-
-    // Delete databases that have not been used in two months
-    // 60 days in milliseconds (1000 * 60 * 60 * 24 * 60)
-    private static final long OBSOLETE_DATABASE_DB = 5184000000L;
-
     static final String INTERNAL_DATABASE_NAME = "internal.db";
     static final String EXTERNAL_DATABASE_NAME = "external.db";
+
+    /**
+     * Raw SQL clause that can be used to obtain the current generation, which
+     * is designed to be populated into {@link MediaColumns#GENERATION_ADDED} or
+     * {@link MediaColumns#GENERATION_MODIFIED}.
+     */
+    public static final String CURRENT_GENERATION_CLAUSE = "SELECT generation FROM local_metadata";
 
     final Context mContext;
     final String mName;
@@ -93,26 +98,44 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
     final boolean mInternal;  // True if this is the internal database
     final boolean mEarlyUpgrade;
     final boolean mLegacyProvider;
-    final Class<? extends Annotation> mColumnAnnotation;
-    final OnSchemaChangeListener mListener;
+    final @Nullable Class<? extends Annotation> mColumnAnnotation;
+    final @Nullable OnSchemaChangeListener mSchemaListener;
+    final @Nullable OnFilesChangeListener mFilesListener;
+    final Set<String> mFilterVolumeNames = new ArraySet<>();
     long mScanStartTime;
     long mScanStopTime;
+    /** Flag indicating if a schema change is in progress */
+    boolean mSchemaChanging;
 
     public interface OnSchemaChangeListener {
         public void onSchemaChange(@NonNull String volumeName, int versionFrom, int versionTo,
                 long itemCount, long durationMillis);
     }
 
+    public interface OnFilesChangeListener {
+        public void onInsert(@NonNull DatabaseHelper helper, @NonNull String volumeName, long id,
+                int mediaType, boolean isDownload);
+        public void onUpdate(@NonNull DatabaseHelper helper, @NonNull String volumeName, long id,
+                int oldMediaType, boolean oldIsDownload,
+                int newMediaType, boolean newIsDownload);
+        public void onDelete(@NonNull DatabaseHelper helper, @NonNull String volumeName, long id,
+                int mediaType, boolean isDownload);
+    }
+
     public DatabaseHelper(Context context, String name,
             boolean internal, boolean earlyUpgrade, boolean legacyProvider,
-            Class<? extends Annotation> columnAnnotation, OnSchemaChangeListener listener) {
-        this(context, name, getDatabaseVersion(context),
-                internal, earlyUpgrade, legacyProvider, columnAnnotation, listener);
+            @Nullable Class<? extends Annotation> columnAnnotation,
+            @Nullable OnSchemaChangeListener schemaListener,
+            @Nullable OnFilesChangeListener filesListener) {
+        this(context, name, getDatabaseVersion(context), internal, earlyUpgrade, legacyProvider,
+                columnAnnotation, schemaListener, filesListener);
     }
 
     public DatabaseHelper(Context context, String name, int version,
             boolean internal, boolean earlyUpgrade, boolean legacyProvider,
-            Class<? extends Annotation> columnAnnotation, OnSchemaChangeListener listener) {
+            @Nullable Class<? extends Annotation> columnAnnotation,
+            @Nullable OnSchemaChangeListener schemaListener,
+            @Nullable OnFilesChangeListener filesListener) {
         super(context, name, null, version);
         mContext = context;
         mName = name;
@@ -122,8 +145,47 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         mEarlyUpgrade = earlyUpgrade;
         mLegacyProvider = legacyProvider;
         mColumnAnnotation = columnAnnotation;
-        mListener = listener;
+        mSchemaListener = schemaListener;
+        mFilesListener = filesListener;
+
+        // Configure default filters until we hear differently
+        if (mInternal) {
+            mFilterVolumeNames.add(MediaStore.VOLUME_INTERNAL);
+        } else {
+            mFilterVolumeNames.add(MediaStore.VOLUME_EXTERNAL_PRIMARY);
+        }
+
         setWriteAheadLoggingEnabled(true);
+    }
+
+    /**
+     * Configure the set of {@link MediaColumns#VOLUME_NAME} that we should use
+     * for filtering query results.
+     * <p>
+     * This is typically set to the list of storage volumes which are currently
+     * mounted, so that we don't leak cached indexed metadata from volumes which
+     * are currently ejected.
+     */
+    public void setFilterVolumeNames(@NonNull Set<String> filterVolumeNames) {
+        synchronized (mFilterVolumeNames) {
+            // Skip update if identical, to help avoid database churn
+            if (mFilterVolumeNames.equals(filterVolumeNames)) {
+                return;
+            }
+
+            mFilterVolumeNames.clear();
+            mFilterVolumeNames.addAll(filterVolumeNames);
+        }
+
+        // Recreate all views to apply this filter
+        final SQLiteDatabase db = getWritableDatabase();
+        try {
+            db.beginTransaction();
+            createLatestViews(db, mInternal);
+            db.setTransactionSuccessful();
+        } finally {
+            db.endTransaction();
+        }
     }
 
     @Override
@@ -139,107 +201,82 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         if (Looper.myLooper() == Looper.getMainLooper()) {
             Log.wtf(TAG, "Database operations must not happen on main thread", new Throwable());
         }
-        return super.getReadableDatabase();
+        return super.getWritableDatabase();
+    }
+
+    @Override
+    public void onConfigure(SQLiteDatabase db) {
+        db.setCustomScalarFunction("_INSERT", (arg) -> {
+            if (arg != null && mFilesListener != null && !mSchemaChanging) {
+                final String[] split = arg.split(":");
+                final String volumeName = split[0];
+                final long id = Long.parseLong(split[1]);
+                final int mediaType = Integer.parseInt(split[2]);
+                final boolean isDownload = Integer.parseInt(split[3]) != 0;
+
+                mFilesListener.onInsert(DatabaseHelper.this, volumeName, id, mediaType, isDownload);
+            }
+            return null;
+        });
+        db.setCustomScalarFunction("_UPDATE", (arg) -> {
+            if (arg != null && mFilesListener != null && !mSchemaChanging) {
+                final String[] split = arg.split(":");
+                final String volumeName = split[0];
+                final long id = Long.parseLong(split[1]);
+                final int oldMediaType = Integer.parseInt(split[2]);
+                final boolean oldIsDownload = Integer.parseInt(split[3]) != 0;
+                final int newMediaType = Integer.parseInt(split[4]);
+                final boolean newIsDownload = Integer.parseInt(split[5]) != 0;
+
+                mFilesListener.onUpdate(DatabaseHelper.this, volumeName, id,
+                        oldMediaType, oldIsDownload, newMediaType, newIsDownload);
+            }
+            return null;
+        });
+        db.setCustomScalarFunction("_DELETE", (arg) -> {
+            if (arg != null && mFilesListener != null && !mSchemaChanging) {
+                final String[] split = arg.split(":");
+                final String volumeName = split[0];
+                final long id = Long.parseLong(split[1]);
+                final int mediaType = Integer.parseInt(split[2]);
+                final boolean isDownload = Integer.parseInt(split[3]) != 0;
+
+                mFilesListener.onDelete(DatabaseHelper.this, volumeName, id, mediaType, isDownload);
+            }
+            return null;
+        });
     }
 
     @Override
     public void onCreate(final SQLiteDatabase db) {
         Log.v(TAG, "onCreate() for " + mName);
-        updateDatabase(db, 0, mVersion);
+        mSchemaChanging = true;
+        try {
+            updateDatabase(db, 0, mVersion);
+        } finally {
+            mSchemaChanging = false;
+        }
     }
 
     @Override
     public void onUpgrade(final SQLiteDatabase db, final int oldV, final int newV) {
         Log.v(TAG, "onUpgrade() for " + mName + " from " + oldV + " to " + newV);
-        updateDatabase(db, oldV, newV);
+        mSchemaChanging = true;
+        try {
+            updateDatabase(db, oldV, newV);
+        } finally {
+            mSchemaChanging = false;
+        }
     }
 
     @Override
     public void onDowngrade(final SQLiteDatabase db, final int oldV, final int newV) {
         Log.v(TAG, "onDowngrade() for " + mName + " from " + oldV + " to " + newV);
-        downgradeDatabase(db, oldV, newV);
-    }
-
-    /**
-     * For devices that have removable storage, we support keeping multiple databases
-     * to allow users to switch between a number of cards.
-     * On such devices, touch this particular database and garbage collect old databases.
-     * An LRU cache system is used to clean up databases for old external
-     * storage volumes.
-     */
-    @Override
-    public void onOpen(SQLiteDatabase db) {
-        if (mEarlyUpgrade) return; // Doing early upgrade.
-        if (mInternal) return;  // The internal database is kept separately.
-
-        // the code below is only needed on devices with removable storage
-        if (!Environment.isExternalStorageRemovable()) return;
-
-        // touch the database file to show it is most recently used
-        File file = new File(db.getPath());
-        long now = System.currentTimeMillis();
-        file.setLastModified(now);
-
-        // delete least recently used databases if we are over the limit
-        String[] databases = mContext.databaseList();
-        // Don't delete wal auxiliary files(db-shm and db-wal) directly because db file may
-        // not be deleted, and it will cause Disk I/O error when accessing this database.
-        List<String> dbList = new ArrayList<String>();
-        for (String database : databases) {
-            if (database != null && database.endsWith(".db")) {
-                dbList.add(database);
-            }
-        }
-        databases = dbList.toArray(new String[0]);
-        int count = databases.length;
-        int limit = MAX_EXTERNAL_DATABASES;
-
-        // delete external databases that have not been used in the past two months
-        long twoMonthsAgo = now - OBSOLETE_DATABASE_DB;
-        for (int i = 0; i < databases.length; i++) {
-            File other = mContext.getDatabasePath(databases[i]);
-            if (INTERNAL_DATABASE_NAME.equals(databases[i]) || file.equals(other)) {
-                databases[i] = null;
-                count--;
-                if (file.equals(other)) {
-                    // reduce limit to account for the existence of the database we
-                    // are about to open, which we removed from the list.
-                    limit--;
-                }
-            } else {
-                long time = other.lastModified();
-                if (time < twoMonthsAgo) {
-                    if (LOGV) Log.v(TAG, "Deleting old database " + databases[i]);
-                    mContext.deleteDatabase(databases[i]);
-                    databases[i] = null;
-                    count--;
-                }
-            }
-        }
-
-        // delete least recently used databases until
-        // we are no longer over the limit
-        while (count > limit) {
-            int lruIndex = -1;
-            long lruTime = 0;
-
-            for (int i = 0; i < databases.length; i++) {
-                if (databases[i] != null) {
-                    long time = mContext.getDatabasePath(databases[i]).lastModified();
-                    if (lruTime == 0 || time < lruTime) {
-                        lruIndex = i;
-                        lruTime = time;
-                    }
-                }
-            }
-
-            // delete least recently used database
-            if (lruIndex != -1) {
-                if (LOGV) Log.v(TAG, "Deleting old database " + databases[lruIndex]);
-                mContext.deleteDatabase(databases[lruIndex]);
-                databases[lruIndex] = null;
-                count--;
-            }
+        mSchemaChanging = true;
+        try {
+            downgradeDatabase(db, oldV, newV);
+        } finally {
+            mSchemaChanging = false;
         }
     }
 
@@ -278,30 +315,86 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
     }
 
     /**
-     * List of {@link Uri} that would have been sent directly via
-     * {@link ContentResolver#notifyChange}, but are instead being collected
-     * due to an ongoing transaction.
+     * Local state related to any transaction currently active on a specific
+     * thread, such as collecting the set of {@link Uri} that should be notified
+     * upon transaction success.
      */
-    private final ThreadLocal<List<Uri>> mNotifyChanges = new ThreadLocal<>();
+    private final ThreadLocal<TransactionState> mTransactionState = new ThreadLocal<>();
+
+    private static class TransactionState {
+        /**
+         * Flag indicating if this transaction has been marked as being
+         * successful.
+         */
+        public boolean successful;
+
+        /**
+         * List of {@link Uri} that would have been sent directly via
+         * {@link ContentResolver#notifyChange}, but are instead being collected
+         * due to this ongoing transaction.
+         */
+        public final List<Uri> notifyChanges = new ArrayList<>();
+    }
 
     public void beginTransaction() {
-        getWritableDatabase().beginTransaction();
-        mNotifyChanges.set(new ArrayList<>());
+        if (mTransactionState.get() != null) {
+            throw new IllegalStateException("Nested transactions not supported");
+        }
+        mTransactionState.set(new TransactionState());
+
+        final SQLiteDatabase db = getWritableDatabase();
+        db.beginTransaction();
+        db.execSQL("UPDATE local_metadata SET generation=generation+1;");
     }
 
     public void setTransactionSuccessful() {
-        getWritableDatabase().setTransactionSuccessful();
-        final List<Uri> uris = mNotifyChanges.get();
-        if (uris != null) {
-            BackgroundThread.getExecutor().execute(() -> {
-                notifyChangeInternal(uris);
-            });
+        final TransactionState state = mTransactionState.get();
+        if (state == null) {
+            throw new IllegalStateException("No transaction in progress");
         }
-        mNotifyChanges.remove();
+        state.successful = true;
+
+        final SQLiteDatabase db = getWritableDatabase();
+        db.setTransactionSuccessful();
     }
 
     public void endTransaction() {
-        getWritableDatabase().endTransaction();
+        final TransactionState state = mTransactionState.get();
+        if (state == null) {
+            throw new IllegalStateException("No transaction in progress");
+        }
+        mTransactionState.remove();
+
+        final SQLiteDatabase db = getWritableDatabase();
+        db.endTransaction();
+
+        if (state.successful) {
+            BackgroundThread.getExecutor().execute(() -> {
+                notifyChangeInternal(state.notifyChanges);
+            });
+        }
+    }
+
+    /**
+     * Execute the given runnable inside a transaction. If the calling thread is
+     * not already in an active transaction, this method will wrap the given
+     * runnable inside a new transaction.
+     */
+    public long runWithTransaction(@NonNull LongSupplier s) {
+        if (mTransactionState.get() != null) {
+            // Already inside a transaction, so we can run directly
+            return s.getAsLong();
+        } else {
+            // Not inside a transaction, so we need to make one
+            beginTransaction();
+            try {
+                final long res = s.getAsLong();
+                setTransactionSuccessful();
+                return res;
+            } finally {
+                endTransaction();
+            }
+        }
     }
 
     /**
@@ -309,11 +402,11 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
      * notification if currently inside a transaction, and they'll be
      * clustered and sent when the transaction completes.
      */
-    public void notifyChange(Uri uri) {
+    public void notifyChange(@NonNull Uri uri) {
         if (LOGV) Log.v(TAG, "Notifying " + uri);
-        final List<Uri> uris = mNotifyChanges.get();
-        if (uris != null) {
-            uris.add(uri);
+        final TransactionState state = mTransactionState.get();
+        if (state != null) {
+            state.notifyChanges.add(uri);
         } else {
             BackgroundThread.getExecutor().execute(() -> {
                 notifySingleChangeInternal(uri);
@@ -420,6 +513,9 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
 
         makePristineSchema(db);
 
+        db.execSQL("CREATE TABLE local_metadata (generation INTEGER DEFAULT 0)");
+        db.execSQL("INSERT INTO local_metadata VALUES (0)");
+
         db.execSQL("CREATE TABLE android_metadata (locale TEXT)");
         db.execSQL("CREATE TABLE thumbnails (_id INTEGER PRIMARY KEY,_data TEXT,image_id INTEGER,"
                 + "kind INTEGER,width INTEGER,height INTEGER)");
@@ -456,7 +552,9 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 + "compilation INTEGER DEFAULT NULL, disc_number TEXT DEFAULT NULL,"
                 + "is_favorite INTEGER DEFAULT 0, num_tracks INTEGER DEFAULT NULL,"
                 + "writer TEXT DEFAULT NULL, exposure_time TEXT DEFAULT NULL,"
-                + "f_number TEXT DEFAULT NULL, iso INTEGER DEFAULT NULL)");
+                + "f_number TEXT DEFAULT NULL, iso INTEGER DEFAULT NULL,"
+                + "scene_capture_type INTEGER DEFAULT NULL, generation_added INTEGER DEFAULT 0,"
+                + "generation_modified INTEGER DEFAULT 0)");
 
         db.execSQL("CREATE TABLE log (time DATETIME, message TEXT)");
         if (!mInternal) {
@@ -594,6 +692,11 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
             return;
         }
 
+        final String filterVolumeNames;
+        synchronized (mFilterVolumeNames) {
+            filterVolumeNames = bindList(mFilterVolumeNames.toArray());
+        }
+
         if (!internal) {
             db.execSQL("CREATE VIEW audio_playlists AS SELECT _id,_data,name,date_added,"
                     + "date_modified,owner_package_name,_hash,is_pending,date_expires,is_trashed,"
@@ -634,16 +737,18 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
 
         db.execSQL("CREATE VIEW audio_artists AS SELECT "
                 + "  artist_id AS " + Audio.Artists._ID
-                + ", artist AS " + Audio.Artists.ARTIST
+                + ", MIN(artist) AS " + Audio.Artists.ARTIST
                 + ", artist_key AS " + Audio.Artists.ARTIST_KEY
                 + ", COUNT(DISTINCT album_id) AS " + Audio.Artists.NUMBER_OF_ALBUMS
                 + ", COUNT(DISTINCT _id) AS " + Audio.Artists.NUMBER_OF_TRACKS
-                + " FROM audio GROUP BY artist_id");
+                + " FROM audio"
+                + " WHERE volume_name IN " + filterVolumeNames
+                + " GROUP BY artist_id");
 
         db.execSQL("CREATE VIEW audio_albums AS SELECT "
                 + "  album_id AS " + Audio.Albums._ID
                 + ", album_id AS " + Audio.Albums.ALBUM_ID
-                + ", album AS " + Audio.Albums.ALBUM
+                + ", MIN(album) AS " + Audio.Albums.ALBUM
                 + ", album_key AS " + Audio.Albums.ALBUM_KEY
                 + ", artist_id AS " + Audio.Albums.ARTIST_ID
                 + ", artist AS " + Audio.Albums.ARTIST
@@ -653,12 +758,16 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 + ", MIN(year) AS " + Audio.Albums.FIRST_YEAR
                 + ", MAX(year) AS " + Audio.Albums.LAST_YEAR
                 + ", NULL AS " + Audio.Albums.ALBUM_ART
-                + " FROM audio GROUP BY album_id");
+                + " FROM audio"
+                + " WHERE volume_name IN " + filterVolumeNames
+                + " GROUP BY album_id");
 
         db.execSQL("CREATE VIEW audio_genres AS SELECT "
                 + "  genre_id AS " + Audio.Genres._ID
-                + ", genre AS " + Audio.Genres.NAME
-                + " FROM audio GROUP BY genre_id");
+                + ", MIN(genre) AS " + Audio.Genres.NAME
+                + " FROM audio"
+                + " WHERE volume_name IN " + filterVolumeNames
+                + " GROUP BY genre_id");
     }
 
     private static void makePristineTriggers(SQLiteDatabase db) {
@@ -674,6 +783,21 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
 
     private static void createLatestTriggers(SQLiteDatabase db, boolean internal) {
         makePristineTriggers(db);
+
+        final String insertArg =
+                "new.volume_name||':'||new._id||':'||new.media_type||':'||new.is_download";
+        final String updateArg =
+                "old.volume_name||':'||old._id||':'||old.media_type||':'||old.is_download"
+                        + "||':'||new.media_type||':'||new.is_download";
+        final String deleteArg =
+                "old.volume_name||':'||old._id||':'||old.media_type||':'||old.is_download";
+
+        db.execSQL("CREATE TRIGGER files_insert AFTER INSERT ON files"
+                + " BEGIN SELECT _INSERT(" + insertArg + "); END");
+        db.execSQL("CREATE TRIGGER files_update AFTER UPDATE ON files"
+                + " BEGIN SELECT _UPDATE(" + updateArg + "); END");
+        db.execSQL("CREATE TRIGGER files_delete AFTER DELETE ON files"
+                + " BEGIN SELECT _DELETE(" + deleteArg + "); END");
     }
 
     private static void updateCollationKeys(SQLiteDatabase db) {
@@ -835,6 +959,33 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         db.execSQL("ALTER TABLE files ADD COLUMN iso INTEGER DEFAULT NULL;");
     }
 
+    private static void updateAddSceneCaptureType(SQLiteDatabase db, boolean internal) {
+        db.execSQL("ALTER TABLE files ADD COLUMN scene_capture_type INTEGER DEFAULT NULL;");
+    }
+
+    private static void updateMigrateLogs(SQLiteDatabase db, boolean internal) {
+        // Migrate any existing logs to new system
+        try (Cursor c = db.query("log", new String[] { "time", "message" },
+                null, null, null, null, null)) {
+            while (c.moveToNext()) {
+                final String time = c.getString(0);
+                final String message = c.getString(1);
+                Logging.logPersistent("Historical log " + time + " " + message);
+            }
+        }
+        db.execSQL("DELETE FROM log;");
+    }
+
+    private static void updateAddLocalMetadata(SQLiteDatabase db, boolean internal) {
+        db.execSQL("CREATE TABLE local_metadata (generation INTEGER DEFAULT 0)");
+        db.execSQL("INSERT INTO local_metadata VALUES (0)");
+    }
+
+    private static void updateAddGeneration(SQLiteDatabase db, boolean internal) {
+        db.execSQL("ALTER TABLE files ADD COLUMN generation_added INTEGER DEFAULT 0;");
+        db.execSQL("ALTER TABLE files ADD COLUMN generation_modified INTEGER DEFAULT 0;");
+    }
+
     private static void recomputeDataValues(SQLiteDatabase db, boolean internal) {
         try (Cursor c = db.query("files", new String[] { FileColumns._ID, FileColumns.DATA },
                 null, null, null, null, null, null)) {
@@ -855,6 +1006,33 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         }
     }
 
+    private static void recomputeMediaTypeValues(SQLiteDatabase db) {
+        // Only update the files with MEDIA_TYPE_NONE.
+        final String selection = FileColumns.MEDIA_TYPE + "=?";
+        final String[] selectionArgs = new String[]{String.valueOf(FileColumns.MEDIA_TYPE_NONE)};
+
+        try (Cursor c = db.query("files", new String[] { FileColumns._ID, FileColumns.MIME_TYPE },
+                selection, selectionArgs, null, null, null, null)) {
+            Log.d(TAG, "Recomputing " + c.getCount() + " MediaType values");
+
+            final ContentValues values = new ContentValues();
+            while (c.moveToNext()) {
+                values.clear();
+                final long id = c.getLong(0);
+                final String mimeType = c.getString(1);
+                // Only update Document and Subtitle media type
+                if (MimeUtils.isDocumentMimeType(mimeType)) {
+                    values.put(FileColumns.MEDIA_TYPE, FileColumns.MEDIA_TYPE_DOCUMENT);
+                } else if (MimeUtils.isSubtitleMimeType(mimeType)) {
+                    values.put(FileColumns.MEDIA_TYPE, FileColumns.MEDIA_TYPE_SUBTITLE);
+                }
+                if (!values.isEmpty()) {
+                    db.update("files", values, "_id=" + id, null);
+                }
+            }
+        }
+    }
+
     static final int VERSION_J = 509;
     static final int VERSION_K = 700;
     static final int VERSION_L = 700;
@@ -863,7 +1041,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
     static final int VERSION_O = 800;
     static final int VERSION_P = 900;
     static final int VERSION_Q = 1023;
-    static final int VERSION_R = 1104;
+    static final int VERSION_R = 1111;
     static final int VERSION_LATEST = VERSION_R;
 
     /**
@@ -976,6 +1154,27 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
             if (fromVersion < 1104) {
                 // Empty version bump to ensure views are recreated
             }
+            if (fromVersion < 1105) {
+                recomputeDataValues = true;
+            }
+            if (fromVersion < 1106) {
+                updateMigrateLogs(db, internal);
+            }
+            if (fromVersion < 1107) {
+                updateAddSceneCaptureType(db, internal);
+            }
+            if (fromVersion < 1108) {
+                updateAddLocalMetadata(db, internal);
+            }
+            if (fromVersion < 1109) {
+                updateAddGeneration(db, internal);
+            }
+            if (fromVersion < 1110) {
+                // Empty version bump to ensure triggers are recreated
+            }
+            if (fromVersion < 1111) {
+                recomputeMediaTypeValues(db);
+            }
 
             if (recomputeDataValues) {
                 recomputeDataValues(db, internal);
@@ -990,11 +1189,8 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         getOrCreateUuid(db);
 
         final long elapsedMillis = (SystemClock.elapsedRealtime() - startTime);
-        final long elapsedSeconds = elapsedMillis / DateUtils.SECOND_IN_MILLIS;
-        logToDb(db, "Database upgraded from version " + fromVersion + " to " + toVersion
-                + " in " + elapsedSeconds + " seconds");
-        if (mListener != null) {
-            mListener.onSchemaChange(mVolumeName, fromVersion, toVersion,
+        if (mSchemaListener != null) {
+            mSchemaListener.onSchemaChange(mVolumeName, fromVersion, toVersion,
                     getItemCount(db), elapsedMillis);
         }
     }
@@ -1006,25 +1202,10 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         createLatestSchema(db);
 
         final long elapsedMillis = (SystemClock.elapsedRealtime() - startTime);
-        final long elapsedSeconds = elapsedMillis / DateUtils.SECOND_IN_MILLIS;
-        logToDb(db, "Database downgraded from version " + fromVersion + " to " + toVersion
-                + " in " + elapsedSeconds + " seconds");
-        if (mListener != null) {
-            mListener.onSchemaChange(mVolumeName, fromVersion, toVersion,
+        if (mSchemaListener != null) {
+            mSchemaListener.onSchemaChange(mVolumeName, fromVersion, toVersion,
                     getItemCount(db), elapsedMillis);
         }
-    }
-
-    /**
-     * Write a persistent diagnostic message to the log table.
-     */
-    public static void logToDb(SQLiteDatabase db, String message) {
-        db.execSQL("INSERT OR REPLACE" +
-                " INTO log (time,message) VALUES (strftime('%Y-%m-%d %H:%M:%f','now'),?);",
-                new String[] { message });
-        // delete all but the last 500 rows
-        db.execSQL("DELETE FROM log WHERE rowid IN" +
-                " (SELECT rowid FROM log ORDER BY rowid DESC LIMIT 500,-1);");
     }
 
     private static final String XATTR_UUID = "user.uuid";
@@ -1053,6 +1234,16 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
     }
 
     /**
+     * Return the current generation that will be populated into
+     * {@link MediaColumns#GENERATION_ADDED} or
+     * {@link MediaColumns#GENERATION_MODIFIED}.
+     */
+    public long getGeneration() {
+        return android.database.DatabaseUtils.longForQuery(getReadableDatabase(),
+                CURRENT_GENERATION_CLAUSE + ";", null);
+    }
+
+    /**
      * Return total number of items tracked inside this database. This includes
      * only real media items, and does not include directories.
      */
@@ -1065,12 +1256,8 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
      * only real media items, and does not include directories.
      */
     private long getItemCount(SQLiteDatabase db) {
-        try (Cursor c = db.query(false, "files", new String[] { "COUNT(_id)" },
-                FileColumns.MIME_TYPE + " IS NOT NULL", null, null, null, null, null, null)) {
-            if (c.moveToFirst()) {
-                return c.getLong(0);
-            }
-        }
-        return 0;
+        return android.database.DatabaseUtils.longForQuery(db,
+                "SELECT COUNT(_id) FROM files WHERE " + FileColumns.MIME_TYPE + " IS NOT NULL",
+                null);
     }
 }

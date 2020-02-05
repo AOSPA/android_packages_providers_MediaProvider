@@ -27,12 +27,13 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
+import android.content.ContentProviderClient;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
 import android.database.Cursor;
-import android.database.sqlite.SQLiteQueryBuilder;
 import android.net.Uri;
+import android.os.CancellationSignal;
 import android.os.Environment;
 import android.provider.MediaStore;
 import android.provider.MediaStore.Images.ImageColumns;
@@ -47,6 +48,7 @@ import androidx.test.runner.AndroidJUnit4;
 import com.android.providers.media.MediaProvider.VolumeArgumentException;
 import com.android.providers.media.scan.MediaScannerTest.IsolatedContext;
 import com.android.providers.media.util.FileUtils;
+import com.android.providers.media.util.SQLiteQueryBuilder;
 
 import org.junit.Ignore;
 import org.junit.Test;
@@ -110,6 +112,23 @@ public class MediaProviderTest {
             try (Cursor c = isolatedResolver.query(probe, null, null, null)) {
                 assertNotNull("probe", c);
             }
+            try {
+                isolatedResolver.getType(probe);
+            } catch (IllegalStateException tolerated) {
+            }
+        }
+    }
+
+    @Test
+    public void testLocale() {
+        final Context context = InstrumentationRegistry.getTargetContext();
+        final Context isolatedContext = new IsolatedContext(context, "modern");
+        final ContentResolver isolatedResolver = isolatedContext.getContentResolver();
+
+        try (ContentProviderClient cpc = isolatedResolver
+                .acquireContentProviderClient(MediaStore.AUTHORITY)) {
+            ((MediaProvider) cpc.getLocalContentProvider())
+                    .onLocaleChanged();
         }
     }
 
@@ -248,6 +267,32 @@ public class MediaProviderTest {
         final Uri uri = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
         assertEndsWith("/Pictures/foo__bar/bar__baz.png",
                 buildFile(uri, "Pictures/foo\0\0bar", "bar::baz.png", "image/png"));
+    }
+
+    @Test
+    public void testBuildData_Playlists() throws Exception {
+        final Uri uri = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
+        assertEndsWith("/Music/my_playlist.m3u",
+                buildFile(uri, null, "my_playlist", "audio/mpegurl"));
+        assertEndsWith("/Movies/my_playlist.pls",
+                buildFile(uri, "Movies", "my_playlist", "audio/x-scpls"));
+    }
+
+    @Test
+    public void testBuildData_Subtitles() throws Exception {
+        final Uri uri = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
+        assertEndsWith("/Movies/my_subtitle.srt",
+                buildFile(uri, null, "my_subtitle", "application/x-subrip"));
+        assertEndsWith("/Music/my_lyrics.lrc",
+                buildFile(uri, "Music", "my_lyrics", "application/lrc"));
+    }
+
+    @Test
+    public void testBuildData_Downloads() throws Exception {
+        final Uri uri = MediaStore.Downloads
+                .getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
+        assertEndsWith("/Download/linux.iso",
+                buildFile(uri, null, "linux.iso", "application/x-iso9660-image"));
     }
 
     @Test
@@ -397,15 +442,6 @@ public class MediaProviderTest {
     }
 
     @Test
-    public void testBindList() {
-        assertEquals("()", MediaProvider.bindList());
-        assertEquals("( 'foo' )", MediaProvider.bindList("foo"));
-        assertEquals("( 'foo' , 'bar' )", MediaProvider.bindList("foo", "bar"));
-        assertEquals("( 'foo' , 'bar' , 'baz' )", MediaProvider.bindList("foo", "bar", "baz"));
-        assertEquals("( 'foo' , NULL , 42 )", MediaProvider.bindList("foo", null, 42));
-    }
-
-    @Test
     public void testIsDownload() throws Exception {
         assertTrue(isDownload("/storage/emulated/0/Download/colors.png"));
         assertTrue(isDownload("/storage/emulated/0/Download/test.pdf"));
@@ -471,6 +507,16 @@ public class MediaProviderTest {
         assertVolume(values, "0000-0000");
         assertBucket(values, "/storage/0000-0000/DCIM/Camera", "Camera");
         assertRelativePath(values, "DCIM/Camera/");
+
+        values = computeDataValues("/storage/476A-17F8/123456/test.png");
+        assertVolume(values, "476a-17f8");
+        assertBucket(values, "/storage/476A-17F8/123456", "123456");
+        assertRelativePath(values, "123456/");
+
+        values = computeDataValues("/storage/476A-17F8/123456/789/test.mp3");
+        assertVolume(values, "476a-17f8");
+        assertBucket(values, "/storage/476A-17F8/123456/789", "789");
+        assertRelativePath(values, "123456/789/");
     }
 
     @Test

@@ -96,6 +96,14 @@ public class TestUtils {
         }
     }
 
+    public static void adoptShellPermissionIdentity(String... permissions) {
+        sUiAutomation.adoptShellPermissionIdentity(permissions);
+    }
+
+    public static void dropShellPermissionIdentity() {
+        sUiAutomation.dropShellPermissionIdentity();
+    }
+
     public static String executeShellCommand(String cmd) throws Exception {
         try (FileInputStream output = new FileInputStream (sUiAutomation.executeShellCommand(cmd)
                 .getFileDescriptor())) {
@@ -194,6 +202,47 @@ public class TestUtils {
             int id = c.getInt(0);
             return ContentUris.withAppendedId(contentUri, id);
         }
+    }
+
+    /**
+     * Queries {@link ContentResolver} for a file and returns the corresponding row ID for its
+     * entry in the database.
+     */
+    @NonNull
+    public static int getFileRowIdFromDatabase(@NonNull ContentResolver cr, @NonNull File file) {
+        int id  = -1;
+        final Uri contentUri = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL);
+        try (Cursor c = cr.query(contentUri,
+                /*projection*/ new String[] { MediaStore.MediaColumns._ID },
+                /*selection*/ MediaStore.MediaColumns.DATA + " = ?",
+                /*selectionArgs*/ new String[] { file.getAbsolutePath() },
+                /*sortOrder*/ null)) {
+            if (c.moveToFirst()) {
+                id = c.getInt(0);
+            }
+        }
+        return id;
+    }
+
+    /**
+     * Queries {@link ContentResolver} for a file and returns the corresponding mime type for its
+     * entry in the database.
+     */
+    @NonNull
+    public static String getFileMimeTypeFromDatabase(@NonNull ContentResolver cr,
+            @NonNull File file) {
+        final Uri contentUri = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL);
+        String mimeType = "";
+        try (Cursor c = cr.query(contentUri,
+                /*projection*/ new String[] { MediaStore.MediaColumns.MIME_TYPE},
+                /*selection*/ MediaStore.MediaColumns.DATA + " = ?",
+                /*selectionArgs*/ new String[] { file.getAbsolutePath() },
+                /*sortOrder*/ null)) {
+            if(c.moveToFirst()) {
+                mimeType = c.getString(0);
+            }
+        }
+        return mimeType;
     }
 
     public static <T extends Exception> void assertThrows(Class<T> clazz, Operation<T> r)

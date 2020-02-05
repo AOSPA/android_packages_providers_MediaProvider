@@ -86,8 +86,11 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.VisibleForTesting;
 
+import com.android.providers.media.util.DatabaseUtils;
+import com.android.providers.media.util.ExifUtils;
 import com.android.providers.media.util.FileUtils;
 import com.android.providers.media.util.IsoInterface;
+import com.android.providers.media.util.Logging;
 import com.android.providers.media.util.LongArray;
 import com.android.providers.media.util.Metrics;
 import com.android.providers.media.util.MimeUtils;
@@ -108,9 +111,12 @@ import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TimeZone;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.regex.Pattern;
 
 /**
@@ -138,6 +144,7 @@ public class ModernMediaScanner implements MediaScanner {
     // TODO: deprecate playlist editing
     // TODO: deprecate PARENT column, since callers can't see directories
 
+    @GuardedBy("sDateFormat")
     private static final SimpleDateFormat sDateFormat;
 
     static {
@@ -161,6 +168,23 @@ public class ModernMediaScanner implements MediaScanner {
      */
     @GuardedBy("mSignals")
     private final ArrayMap<String, CancellationSignal> mSignals = new ArrayMap<>();
+
+    /**
+     * Holder that contains a reference count of the number of threads
+     * interested in a specific directory, along with a lock to ensure that
+     * parallel scans don't overlap and confuse each other.
+     */
+    private static class DirectoryLock {
+        public int count;
+        public final Lock lock = new ReentrantLock();
+    }
+
+    /**
+     * Map from directory to locks designed to ensure that parallel scans don't
+     * overlap and confuse each other.
+     */
+    @GuardedBy("mLocks")
+    private final Map<Path, DirectoryLock> mDirectoryLocks = new ArrayMap<>();
 
     /**
      * Set of MIME types that should be considered to be DRM, meaning we need to
@@ -241,7 +265,9 @@ public class ModernMediaScanner implements MediaScanner {
         private final Uri mFilesUri;
         private final CancellationSignal mSignal;
 
+        private final long mStartGeneration;
         private final boolean mSingleFile;
+        private final Set<Path> mAcquiredDirectoryLocks = new ArraySet<>();
         private final ArrayList<ContentProviderOperation> mPending = new ArrayList<>();
         private LongArray mScannedIds = new LongArray();
         private LongArray mUnknownIds = new LongArray();
@@ -267,6 +293,7 @@ public class ModernMediaScanner implements MediaScanner {
             mFilesUri = MediaStore.Files.getContentUri(mVolumeName);
             mSignal = getOrCreateSignal(mVolumeName);
 
+            mStartGeneration = MediaStore.getGeneration(mResolver, mVolumeName);
             mSingleFile = mRoot.isFile();
 
             Trace.endSection();
@@ -305,12 +332,18 @@ public class ModernMediaScanner implements MediaScanner {
             mSignal.throwIfCanceled();
             if (!isDirectoryHiddenRecursive(mSingleFile ? mRoot.getParentFile() : mRoot)) {
                 Trace.beginSection("walkFileTree");
+                if (mSingleFile) {
+                    acquireDirectoryLock(mRoot.getParentFile().toPath());
+                }
                 try {
                     Files.walkFileTree(mRoot.toPath(), this);
                 } catch (IOException e) {
                     // This should never happen, so yell loudly
                     throw new IllegalStateException(e);
                 } finally {
+                    if (mSingleFile) {
+                        releaseDirectoryLock(mRoot.getParentFile().toPath());
+                    }
                     Trace.endSection();
                 }
                 applyPending();
@@ -331,10 +364,12 @@ public class ModernMediaScanner implements MediaScanner {
                     + MtpConstants.FORMAT_UNDEFINED + ") != "
                     + MtpConstants.FORMAT_ABSTRACT_AV_PLAYLIST;
             final String dataClause = FileColumns.DATA + " LIKE ? ESCAPE '\\'";
+            final String generationClause = FileColumns.GENERATION_ADDED + " <= "
+                    + mStartGeneration;
 
             final Bundle queryArgs = new Bundle();
             queryArgs.putString(ContentResolver.QUERY_ARG_SQL_SELECTION,
-                    formatClause + " AND " + dataClause);
+                    formatClause + " AND " + dataClause + " AND " + generationClause);
             queryArgs.putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS,
                     new String[] { escapeForLike(mRoot.getAbsolutePath(), mSingleFile) });
             queryArgs.putString(ContentResolver.QUERY_ARG_SQL_SORT_ORDER,
@@ -388,11 +423,61 @@ public class ModernMediaScanner implements MediaScanner {
             }
         }
 
+        /**
+         * Create and acquire a lock on the given directory, giving the calling
+         * thread exclusive access to ensure that parallel scans don't overlap
+         * and confuse each other.
+         */
+        private void acquireDirectoryLock(@NonNull Path dir) {
+            Trace.beginSection("acquireDirectoryLock");
+            DirectoryLock lock;
+            synchronized (mDirectoryLocks) {
+                lock = mDirectoryLocks.get(dir);
+                if (lock == null) {
+                    lock = new DirectoryLock();
+                    mDirectoryLocks.put(dir, lock);
+                }
+                lock.count++;
+            }
+            lock.lock.lock();
+            mAcquiredDirectoryLocks.add(dir);
+            Trace.endSection();
+        }
+
+        /**
+         * Release a currently held lock on the given directory, releasing any
+         * other waiting parallel scans to proceed, and cleaning up data
+         * structures if no other threads are waiting.
+         */
+        private void releaseDirectoryLock(@NonNull Path dir) {
+            Trace.beginSection("releaseDirectoryLock");
+            DirectoryLock lock;
+            synchronized (mDirectoryLocks) {
+                lock = mDirectoryLocks.get(dir);
+                if (lock == null) {
+                    throw new IllegalStateException();
+                }
+                if (--lock.count == 0) {
+                    mDirectoryLocks.remove(dir);
+                }
+            }
+            lock.lock.unlock();
+            mAcquiredDirectoryLocks.remove(dir);
+            Trace.endSection();
+        }
+
         @Override
         public void close() {
             // Sanity check that we drained any pending operations
             if (!mPending.isEmpty()) {
                 throw new IllegalStateException();
+            }
+
+            // Release any locks we're still holding, typically when we
+            // encountered an exception; we snapshot the original list so we're
+            // not confused as it's mutated by release operations
+            for (Path dir : new ArraySet<>(mAcquiredDirectoryLocks)) {
+                releaseDirectoryLock(dir);
             }
 
             mClient.close();
@@ -407,6 +492,10 @@ public class ModernMediaScanner implements MediaScanner {
             if (isDirectoryHidden(dir.toFile())) {
                 return FileVisitResult.SKIP_SUBTREE;
             }
+
+            // Acquire lock on this directory to ensure parallel scans don't
+            // overlap and confuse each other
+            acquireDirectoryLock(dir);
 
             // Scan this directory as a normal file so that "parent" database
             // entries are created
@@ -506,6 +595,14 @@ public class ModernMediaScanner implements MediaScanner {
         @Override
         public FileVisitResult postVisitDirectory(Path dir, IOException exc)
                 throws IOException {
+            // We need to drain all pending changes related to this directory
+            // before releasing our lock below
+            applyPending();
+
+            // Now that we're finished scanning this directory, release lock to
+            // allow other parallel scans to proceed
+            releaseDirectoryLock(dir);
+
             return FileVisitResult.CONTINUE;
         }
 
@@ -524,6 +621,9 @@ public class ModernMediaScanner implements MediaScanner {
         }
 
         private void applyPending() {
+            // Bail early when nothing pending
+            if (mPending.isEmpty()) return;
+
             Trace.beginSection("applyPending");
             try {
                 ContentProviderResult[] results = mResolver.applyBatch(AUTHORITY, mPending);
@@ -592,6 +692,8 @@ public class ModernMediaScanner implements MediaScanner {
                 return scanItemPlaylist(existingId, file, attrs, mimeType, volumeName);
             case FileColumns.MEDIA_TYPE_SUBTITLE:
                 return scanItemSubtitle(existingId, file, attrs, mimeType, volumeName);
+            case FileColumns.MEDIA_TYPE_DOCUMENT:
+                return scanItemDocument(existingId, file, attrs, mimeType, volumeName);
             default:
                 return scanItemFile(existingId, file, attrs, mimeType, volumeName);
         }
@@ -803,6 +905,15 @@ public class ModernMediaScanner implements MediaScanner {
         return op;
     }
 
+    private static @NonNull ContentProviderOperation.Builder scanItemDocument(long existingId,
+            File file, BasicFileAttributes attrs, String mimeType, String volumeName) {
+        final ContentProviderOperation.Builder op = newUpsert(
+                MediaStore.Files.getContentUri(volumeName), existingId);
+        withGenericValues(op, file, attrs, mimeType);
+
+        return op;
+    }
+
     private static @NonNull ContentProviderOperation.Builder scanItemVideo(long existingId,
             File file, BasicFileAttributes attrs, String mimeType, String volumeName) {
         final ContentProviderOperation.Builder op = newUpsert(
@@ -878,6 +989,8 @@ public class ModernMediaScanner implements MediaScanner {
                     parseOptional(exif.getAttribute(ExifInterface.TAG_F_NUMBER)));
             withOptionalValue(op, ImageColumns.ISO,
                     parseOptional(exif.getAttribute(ExifInterface.TAG_ISO_SPEED_RATINGS)));
+            withOptionalValue(op, ImageColumns.SCENE_CAPTURE_TYPE,
+                    parseOptional(exif.getAttribute(ExifInterface.TAG_SCENE_CAPTURE_TYPE)));
 
             // Also hunt around for XMP metadata
             final XmpInterface xmp = XmpInterface.fromContainer(exif);
@@ -971,14 +1084,14 @@ public class ModernMediaScanner implements MediaScanner {
      */
     static @NonNull Optional<Long> parseOptionalDateTaken(@NonNull ExifInterface exif,
             long lastModifiedTime) {
-        final long originalTime = exif.getDateTimeOriginal();
+        final long originalTime = ExifUtils.getDateTimeOriginal(exif);
         if (exif.hasAttribute(ExifInterface.TAG_OFFSET_TIME_ORIGINAL)) {
             // We have known offset information, return it directly!
             return Optional.of(originalTime);
         } else {
             // Otherwise we need to guess the offset from unrelated fields
             final long smallestZone = 15 * MINUTE_IN_MILLIS;
-            final long gpsTime = exif.getGpsDateTime();
+            final long gpsTime = ExifUtils.getGpsDateTime(exif);
             if (gpsTime > 0) {
                 final long offset = gpsTime - originalTime;
                 if (Math.abs(offset) < 24 * HOUR_IN_MILLIS) {
@@ -1045,8 +1158,10 @@ public class ModernMediaScanner implements MediaScanner {
     private static @NonNull Optional<Long> parseOptionalDate(@Nullable String date) {
         if (TextUtils.isEmpty(date)) return Optional.empty();
         try {
-            final long value = sDateFormat.parse(date).getTime();
-            return (value > 0) ? Optional.of(value) : Optional.empty();
+            synchronized (sDateFormat) {
+                final long value = sDateFormat.parse(date).getTime();
+                return (value > 0) ? Optional.of(value) : Optional.empty();
+            }
         } catch (ParseException e) {
             return Optional.empty();
         }
@@ -1144,6 +1259,7 @@ public class ModernMediaScanner implements MediaScanner {
             return true;
         }
         if (nomedia.exists()) {
+            Logging.logPersistent("Observed non-standard " + nomedia);
             return true;
         }
         return false;
@@ -1162,19 +1278,12 @@ public class ModernMediaScanner implements MediaScanner {
      * Escape the given argument for use in a {@code LIKE} statement.
      */
     static String escapeForLike(String arg, boolean singleFile) {
-        final StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < arg.length(); i++) {
-            final char c = arg.charAt(i);
-            switch (c) {
-                case '%': sb.append('\\');
-                case '_': sb.append('\\');
-            }
-            sb.append(c);
+        final String escaped = DatabaseUtils.escapeForLike(arg);
+        if (singleFile) {
+            return escaped;
+        } else {
+            return escaped + "/%";
         }
-        if (!singleFile) {
-            sb.append('%');
-        }
-        return sb.toString();
     }
 
     static void logTroubleScanning(File file, Exception e) {

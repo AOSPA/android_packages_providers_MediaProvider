@@ -157,9 +157,15 @@ public final class MediaStore {
     /** {@hide} */
     public static final String CREATE_DELETE_REQUEST_CALL = "create_delete_request";
 
-
     /** {@hide} */
     public static final String GET_VERSION_CALL = "get_version";
+    /** {@hide} */
+    public static final String GET_GENERATION_CALL = "get_generation";
+
+    /** {@hide} */
+    @Deprecated
+    public static final String EXTERNAL_STORAGE_PROVIDER_AUTHORITY =
+            "com.android.externalstorage.documents";
 
     /** {@hide} */
     public static final String GET_DOCUMENT_URI_CALL = "get_document_uri";
@@ -1191,6 +1197,40 @@ public final class MediaStore {
         @Column(value = Cursor.FIELD_TYPE_INTEGER, readOnly = true)
         public static final String IS_DOWNLOAD = "is_download";
 
+        /**
+         * Generation number at which metadata for this media item was first
+         * inserted. This is useful for apps that are attempting to quickly
+         * identify exactly which media items have been added since a previous
+         * point in time. Generation numbers are monotonically increasing over
+         * time, and can be safely arithmetically compared.
+         * <p>
+         * Detecting media additions using generation numbers is more robust
+         * than using {@link #DATE_ADDED}, since those values may change in
+         * unexpected ways when apps use {@link File#setLastModified(long)} or
+         * when the system clock is set incorrectly.
+         *
+         * @see MediaStore#getGeneration(Context, String)
+         */
+        @Column(value = Cursor.FIELD_TYPE_INTEGER, readOnly = true)
+        public static final String GENERATION_ADDED = "generation_added";
+
+        /**
+         * Generation number at which metadata for this media item was last
+         * changed. This is useful for apps that are attempting to quickly
+         * identify exactly which media items have changed since a previous
+         * point in time. Generation numbers are monotonically increasing over
+         * time, and can be safely arithmetically compared.
+         * <p>
+         * Detecting media changes using generation numbers is more robust than
+         * using {@link #DATE_MODIFIED}, since those values may change in
+         * unexpected ways when apps use {@link File#setLastModified(long)} or
+         * when the system clock is set incorrectly.
+         *
+         * @see MediaStore#getGeneration(Context, String)
+         */
+        @Column(value = Cursor.FIELD_TYPE_INTEGER, readOnly = true)
+        public static final String GENERATION_MODIFIED = "generation_modified";
+
         // =======================================
         // ==== MediaMetadataRetriever values ====
         // =======================================
@@ -1458,7 +1498,7 @@ public final class MediaStore {
             public static final String TITLE = "title";
 
             /**
-             * The media type (audio, video, image or playlist)
+             * The media type (audio, video, image, document, playlist or subtitle)
              * of the file, or 0 for not a media file
              */
             @Column(Cursor.FIELD_TYPE_INTEGER)
@@ -1466,7 +1506,7 @@ public final class MediaStore {
 
             /**
              * Constant for the {@link #MEDIA_TYPE} column indicating that file
-             * is not an audio, image, video, playlist, or subtitles file.
+             * is not an audio, image, video, document, playlist, or subtitles file.
              */
             public static final int MEDIA_TYPE_NONE = 0;
 
@@ -1499,6 +1539,11 @@ public final class MediaStore {
              * is a subtitles or lyrics file.
              */
             public static final int MEDIA_TYPE_SUBTITLE = 5;
+
+            /**
+             * Constant for the {@link #MEDIA_TYPE} column indicating that file is a document file.
+             */
+            public static final int MEDIA_TYPE_DOCUMENT = 6;
         }
     }
 
@@ -1785,6 +1830,13 @@ public final class MediaStore {
              */
             @Column(value = Cursor.FIELD_TYPE_INTEGER, readOnly = true)
             public static final String ISO = "iso";
+
+            /**
+             * Indexed value of {@link ExifInterface#TAG_SCENE_CAPTURE_TYPE}
+             * extracted from this media item.
+             */
+            @Column(value = Cursor.FIELD_TYPE_INTEGER, readOnly = true)
+            public static final String SCENE_CAPTURE_TYPE = "scene_capture_type";
         }
 
         public static final class Media implements ImageColumns {
@@ -3619,6 +3671,39 @@ public final class MediaStore {
         } catch (RemoteException e) {
             throw e.rethrowAsRuntimeException();
         }
+    }
+
+    /**
+     * Return the latest generation value for the given volume.
+     * <p>
+     * Generation numbers are useful for apps that are attempting to quickly
+     * identify exactly which media items have been added or changed since a
+     * previous point in time. Generation numbers are monotonically increasing
+     * over time, and can be safely arithmetically compared.
+     * <p>
+     * Detecting media changes using generation numbers is more robust than
+     * using {@link MediaColumns#DATE_ADDED} or
+     * {@link MediaColumns#DATE_MODIFIED}, since those values may change in
+     * unexpected ways when apps use {@link File#setLastModified(long)} or when
+     * the system clock is set incorrectly.
+     *
+     * @param volumeName specific volume to obtain an generation value for. Must
+     *            be one of the values returned from
+     *            {@link #getExternalVolumeNames(Context)}.
+     * @see MediaColumns#GENERATION_ADDED
+     * @see MediaColumns#GENERATION_MODIFIED
+     */
+    public static long getGeneration(@NonNull Context context, @NonNull String volumeName) {
+        return getGeneration(context.getContentResolver(), volumeName);
+    }
+
+    /** {@hide} */
+    public static long getGeneration(@NonNull ContentResolver resolver,
+            @NonNull String volumeName) {
+        final Bundle in = new Bundle();
+        in.putString(Intent.EXTRA_TEXT, volumeName);
+        final Bundle out = resolver.call(AUTHORITY, GET_GENERATION_CALL, null, in);
+        return out.getLong(Intent.EXTRA_INDEX);
     }
 
     /**
