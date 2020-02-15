@@ -84,8 +84,8 @@ public class FuseDaemonHostTest extends BaseHostJUnit4Test {
     }
 
     @Test
-    public void testDeleteNonemptyDir() throws Exception {
-        runDeviceTest("testDeleteNonemptyDir");
+    public void testCantDeleteOtherAppsContents() throws Exception {
+        runDeviceTest("testCantDeleteOtherAppsContents");
     }
 
     @Test
@@ -185,7 +185,32 @@ public class FuseDaemonHostTest extends BaseHostJUnit4Test {
     }
 
     @Test
+    public void testSystemGalleryAppHasFullAccessToImages() throws Exception {
+        runDeviceTest("testSystemGalleryAppHasFullAccessToImages");
+    }
+
+    @Test
+    public void testSystemGalleryAppHasNoFullAccessToAudio() throws Exception {
+        runDeviceTest("testSystemGalleryAppHasNoFullAccessToAudio");
+    }
+
+    @Test
+    public void testSystemGalleryCanRenameImagesAndVideos() throws Exception {
+        runDeviceTest("testSystemGalleryCanRenameImagesAndVideos");
+    }
+
+    @Test
     public void testManageExternalStorageBypassesMediaProviderRestrictions() throws Exception {
         runDeviceTest("testManageExternalStorageBypassesMediaProviderRestrictions");
+    }
+
+    @Test
+    public void testCantAccessOtherAppsContents() throws Exception {
+        runDeviceTest("testCantAccessOtherAppsContents");
+    }
+
+    @Test
+    public void testCanCreateHiddenFile() throws Exception {
+        runDeviceTest("testCanCreateHiddenFile");
     }
 }

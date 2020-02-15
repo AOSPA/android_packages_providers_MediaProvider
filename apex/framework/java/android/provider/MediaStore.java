@@ -28,9 +28,9 @@ import android.annotation.SdkConstant.SdkConstantType;
 import android.annotation.SuppressLint;
 import android.annotation.SystemApi;
 import android.annotation.TestApi;
-import android.annotation.UnsupportedAppUsage;
 import android.app.Activity;
 import android.app.PendingIntent;
+import android.compat.annotation.UnsupportedAppUsage;
 import android.content.ClipData;
 import android.content.ContentProviderClient;
 import android.content.ContentResolver;
@@ -364,6 +364,22 @@ public final class MediaStore {
      */
     public static final String META_DATA_STILL_IMAGE_CAMERA_PREWARM_SERVICE =
             "android.media.still_image_camera_preview_service";
+
+    /**
+     * Name under which an activity handling {@link #ACTION_REVIEW} or
+     * {@link #ACTION_REVIEW_SECURE} publishes the service name for its prewarm
+     * service.
+     * <p>
+     * This meta-data should reference the fully qualified class name of the prewarm service
+     * <p>
+     * The prewarm service can be bound before starting {@link #ACTION_REVIEW} or
+     * {@link #ACTION_REVIEW_SECURE}.
+     * An application implementing this prewarm service should do the absolute minimum amount of
+     * work to initialize its resources to efficiently handle an {@link #ACTION_REVIEW} or
+     * {@link #ACTION_REVIEW_SECURE} in the near future.
+     */
+    public static final java.lang.String META_DATA_REVIEW_GALLERY_PREWARM_SERVICE =
+            "android.media.review_gallery_prewarm_service";
 
     /**
      * The name of the Intent action used to launch a camera in still image mode
