@@ -38,6 +38,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.database.Cursor;
 import android.net.Uri;
+import android.os.Environment;
 import android.os.ParcelFileDescriptor;
 import android.provider.MediaStore;
 import android.util.Log;
@@ -58,6 +59,7 @@ import java.io.FileInputStream;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /**
  * General helper functions for FuseDaemon tests.
@@ -70,6 +72,9 @@ public class TestUtils {
     public static final String INTENT_EXCEPTION = "com.android.tests.fused.exception";
     public static final String CREATE_FILE_QUERY = "com.android.tests.fused.createfile";
     public static final String DELETE_FILE_QUERY = "com.android.tests.fused.deletefile";
+
+    private static final long POLLING_TIMEOUT_MILLIS = TimeUnit.SECONDS.toMillis(10);
+    private static final long POLLING_SLEEP_MILLIS = 100;
 
 
     private static final UiAutomation sUiAutomation = InstrumentationRegistry.getInstrumentation()
@@ -141,6 +146,8 @@ public class TestUtils {
 
     /**
      * Makes the given {@code testApp} create a file.
+     *
+     * <p>This method drops shell permission identity.
      */
     public static boolean createFileAs(TestApp testApp, String path) throws Exception {
         return createOrDeleteFileFromTestApp(testApp, path, CREATE_FILE_QUERY);
@@ -148,6 +155,8 @@ public class TestUtils {
 
     /**
      * Makes the given {@code testApp} delete a file.
+     *
+     * <p>This method drops shell permission identity.
      */
     public static boolean deleteFileAs(TestApp testApp, String path) throws Exception {
         return createOrDeleteFileFromTestApp(testApp, path, DELETE_FILE_QUERY);
@@ -376,6 +385,20 @@ public class TestUtils {
         return path.delete();
     }
 
+    public static void pollForExternalStorageState() throws Exception {
+        for (int i = 0; i < POLLING_TIMEOUT_MILLIS / POLLING_SLEEP_MILLIS; i++) {
+            if(Environment.getExternalStorageState(Environment.getExternalStorageDirectory())
+                    .equals(Environment.MEDIA_MOUNTED)) {
+                return;
+            }
+            Thread.sleep(POLLING_SLEEP_MILLIS);
+        }
+        fail("Timed out while waiting for ExternalStorageState to be MEDIA_MOUNTED");
+    }
+
+    /**
+     * <p>This method drops shell permission identity.
+     */
     private static void forceStopApp(String packageName) throws Exception {
         try {
             sUiAutomation.adoptShellPermissionIdentity(Manifest.permission.FORCE_STOP_PACKAGES);
@@ -387,6 +410,9 @@ public class TestUtils {
         }
     }
 
+    /**
+     * <p>This method drops shell permission identity.
+     */
     private static void sendIntentToTestApp(TestApp testApp, String dirPath, String actionName,
             BroadcastReceiver broadcastReceiver, CountDownLatch latch) throws Exception {
 
@@ -410,6 +436,11 @@ public class TestUtils {
         getContext().unregisterReceiver(broadcastReceiver);
     }
 
+    /**
+     * Gets images/video metadata from a test app.
+     *
+     * <p>This method drops shell permission identity.
+     */
     private static HashMap<String, String> getMetadataFromTestApp(TestApp testApp, String dirPath,
             String actionName) throws Exception {
         final CountDownLatch latch = new CountDownLatch(1);
@@ -432,6 +463,9 @@ public class TestUtils {
         return appOutputList;
     }
 
+    /**
+     * <p>This method drops shell permission identity.
+     */
     private static ArrayList<String> getContentsFromTestApp(TestApp testApp, String dirPath,
             String actionName) throws Exception {
         final CountDownLatch latch = new CountDownLatch(1);
@@ -450,6 +484,9 @@ public class TestUtils {
         return appOutputList;
     }
 
+    /**
+     * <p>This method drops shell permission identity.
+     */
     private static boolean createOrDeleteFileFromTestApp(TestApp testApp, String dirPath,
             String actionName) throws Exception {
         final CountDownLatch latch = new CountDownLatch(1);
