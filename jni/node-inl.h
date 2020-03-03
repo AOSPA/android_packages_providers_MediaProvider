@@ -34,14 +34,16 @@ namespace mediaprovider {
 namespace fuse {
 
 struct handle {
-    explicit handle(const std::string& path, int fd, const RedactionInfo* ri, bool cached)
-        : path(path), fd(fd), ri(ri), cached(cached) {
+    explicit handle(const std::string& path, int fd, const RedactionInfo* ri, uid_t owner_uid,
+                    bool cached)
+        : path(path), fd(fd), ri(ri), owner_uid(owner_uid), cached(cached) {
         CHECK(ri != nullptr);
     }
 
     const std::string path;
     const int fd;
     const std::unique_ptr<const RedactionInfo> ri;
+    const uid_t owner_uid;
     const bool cached;
 
     ~handle() { close(fd); }
@@ -156,6 +158,11 @@ class node {
     const std::string& GetName() const {
         std::lock_guard<std::recursive_mutex> guard(*lock_);
         return name_;
+    }
+
+    node* GetParent() const {
+        std::lock_guard<std::recursive_mutex> guard(*lock_);
+        return parent_;
     }
 
     inline void AddHandle(handle* h) {

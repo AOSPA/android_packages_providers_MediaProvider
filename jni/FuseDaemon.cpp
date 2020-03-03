@@ -299,6 +299,7 @@ struct fuse {
     std::recursive_mutex lock;
     const string path;
     node* const root;
+    struct fuse_session* se;
 
     /*
      * Used to make JNI calls to MediaProvider.
@@ -853,7 +854,15 @@ static void pf_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi) {
         return;
     }
 
-    const int fd = open(path.c_str(), fi->flags);
+    // With the writeback cache enabled, FUSE may generate READ requests even for files that
+    // were opened O_WRONLY; so make sure we open it O_RDWR instead.
+    int open_flags = fi->flags;
+    if (open_flags & O_WRONLY) {
+        open_flags &= ~O_WRONLY;
+        open_flags |= O_RDWR;
+    }
+
+    const int fd = open(path.c_str(), open_flags);
     if (fd < 0) {
         fuse_reply_err(req, errno);
         return;
@@ -897,7 +906,7 @@ static void pf_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi) {
         TRACE_FUSE(fuse) << "Using cache for " << path;
     }
 
-    handle* h = new handle(path, fd, ri.release(), !fi->direct_io);
+    handle* h = new handle(path, fd, ri.release(), /*owner_uid*/ -1, !fi->direct_io);
     node->AddHandle(h);
 
     fi->fh = ptr_to_id(h);
@@ -1104,8 +1113,10 @@ static void pf_release(fuse_req_t req,
                      << "0" << std::oct << fi->flags << " " << h << "(" << h->fd << ")";
 
     fuse->fadviser.Close(h->fd);
-    // TODO(b/145737191): Figure out if we need to scan files on close, and how to do it properly
     if (node) {
+        if (h->owner_uid != -1) {
+            fuse->mp->ScanFile(h->path, h->owner_uid);
+        }
         node->DestroyHandle(h);
     }
 
@@ -1360,8 +1371,16 @@ static void pf_create(fuse_req_t req,
         return;
     }
 
+    // With the writeback cache enabled, FUSE may generate READ requests even for files that
+    // were opened O_WRONLY; so make sure we open it O_RDWR instead.
+    int open_flags = fi->flags;
+    if (open_flags & O_WRONLY) {
+        open_flags &= ~O_WRONLY;
+        open_flags |= O_RDWR;
+    }
+
     mode = (mode & (~0777)) | 0664;
-    int fd = open(child_path.c_str(), fi->flags, mode);
+    int fd = open(child_path.c_str(), open_flags, mode);
     if (fd < 0) {
         int error_code = errno;
         // We've already inserted the file into the MP database before the
@@ -1375,7 +1394,7 @@ static void pf_create(fuse_req_t req,
     // This prevents crashing during reads but can be a security hole if a malicious app opens an fd
     // to the file before all the EXIF content is written. We could special case reads before the
     // first close after a file has just been created.
-    handle* h = new handle(child_path, fd, new RedactionInfo(), true /* cached */);
+    handle* h = new handle(child_path, fd, new RedactionInfo(), ctx->uid, /*cached*/ true);
     fi->fh = ptr_to_id(h);
     fi->keep_cache = 1;
 
@@ -1521,6 +1540,31 @@ bool FuseDaemon::ShouldOpenWithFuse(int fd, bool for_read, const std::string& pa
     return use_fuse;
 }
 
+void FuseDaemon::InvalidateFuseDentryCache(const std::string& path) {
+    TRACE_VERBOSE << "Invalidating dentry for path " << path;
+
+    if (active.load(std::memory_order_acquire)) {
+        string name;
+        fuse_ino_t parent;
+
+        {
+            std::lock_guard<std::recursive_mutex> guard(fuse->lock);
+            const node* node = node::LookupAbsolutePath(fuse->root, path);
+            if (node) {
+                name = node->GetName();
+                parent = fuse->ToInode(node->GetParent());
+            }
+        }
+
+        if (!name.empty() &&
+            fuse_lowlevel_notify_inval_entry(fuse->se, parent, name.c_str(), name.size())) {
+            LOG(ERROR) << "Failed to invalidate dentry for path " << path;
+        }
+    } else {
+        TRACE << "FUSE daemon is inactive. Cannot invalidate dentry for " << path;
+    }
+}
+
 FuseDaemon::FuseDaemon(JNIEnv* env, jobject mediaProvider) : mp(env, mediaProvider),
                                                              active(false), fuse(nullptr) {}
 
@@ -1575,6 +1619,7 @@ void FuseDaemon::Start(const int fd, const std::string& path) {
         PLOG(ERROR) << "Failed to create session ";
         return;
     }
+    fuse_default.se = se;
     se->fd = fd;
     se->mountpoint = strdup(path.c_str());
 
