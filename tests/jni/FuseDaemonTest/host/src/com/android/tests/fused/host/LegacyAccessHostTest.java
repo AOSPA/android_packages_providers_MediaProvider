@@ -25,6 +25,7 @@ import com.android.tradefed.testtype.junit4.BaseHostJUnit4Test;
 
 import org.junit.After;
 import org.junit.Before;
+import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
@@ -107,14 +108,14 @@ public class LegacyAccessHostTest extends BaseHostJUnit4Test {
     @Test
     public void testCreateFilesInRandomPlaces_hasW() throws Exception {
         revokePermissions("android.permission.READ_EXTERNAL_STORAGE");
-        executeShellCommand("mkdir -p /sdcard/Android/data/com.android.shell");
+        executeShellCommand("mkdir -p /sdcard/Android/data/com.android.shell -m 2770");
         runDeviceTest("testCreateFilesInRandomPlaces_hasW");
     }
 
     @Test
     public void testMkdirInRandomPlaces_hasW() throws Exception {
         revokePermissions("android.permission.READ_EXTERNAL_STORAGE");
-        executeShellCommand("mkdir -p /sdcard/Android/data/com.android.shell");
+        executeShellCommand("mkdir -p /sdcard/Android/data/com.android.shell -m 2770");
         runDeviceTest("testMkdirInRandomPlaces_hasW");
     }
 
@@ -153,6 +154,7 @@ public class LegacyAccessHostTest extends BaseHostJUnit4Test {
 
     }
 
+    @Ignore("Re-enable as part of b/145737191")
     @Test
     public void testCanRename_hasRW() throws Exception {
         runDeviceTest("testCanRename_hasRW");
@@ -161,7 +163,12 @@ public class LegacyAccessHostTest extends BaseHostJUnit4Test {
     @Test
     public void testCantRename_hasR() throws Exception {
         revokePermissions("android.permission.WRITE_EXTERNAL_STORAGE");
-        runDeviceTest("testCantRename_hasR");
+        createFileAsShell(SHELL_FILE, /*bypassFuse*/ true);
+        try {
+            runDeviceTest("testCantRename_hasR");
+        } finally {
+            executeShellCommand("rm " + SHELL_FILE);
+        }
     }
 
 
@@ -177,11 +184,13 @@ public class LegacyAccessHostTest extends BaseHostJUnit4Test {
         }
     }
 
+    @Ignore("Re-enable as part of b/145737191")
     @Test
     public void testCanDeleteAllFiles_hasRW() throws Exception {
         runDeviceTest("testCanDeleteAllFiles_hasRW");
     }
 
+    @Ignore("Re-enable as part of b/145737191")
     @Test
     public void testLegacyAppCanOwnAFile_hasW() throws Exception {
         runDeviceTest("testLegacyAppCanOwnAFile_hasW");

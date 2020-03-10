@@ -25,8 +25,12 @@ import static com.android.tests.fused.lib.RedactionTestHelper.assertExifMetadata
 import static com.android.tests.fused.lib.RedactionTestHelper.assertExifMetadataMismatch;
 import static com.android.tests.fused.lib.RedactionTestHelper.getExifMetadata;
 import static com.android.tests.fused.lib.RedactionTestHelper.getExifMetadataFromRawResource;
+import static com.android.tests.fused.lib.TestUtils.assertCanRenameFile;
+import static com.android.tests.fused.lib.TestUtils.assertCanRenameDirectory;
 import static com.android.tests.fused.lib.TestUtils.adoptShellPermissionIdentity;
 import static com.android.tests.fused.lib.TestUtils.allowAppOpsToUid;
+import static com.android.tests.fused.lib.TestUtils.assertCantRenameDirectory;
+import static com.android.tests.fused.lib.TestUtils.assertCantRenameFile;
 import static com.android.tests.fused.lib.TestUtils.assertThrows;
 import static com.android.tests.fused.lib.TestUtils.createFileAs;
 import static com.android.tests.fused.lib.TestUtils.deleteFileAs;
@@ -56,7 +60,6 @@ import static junit.framework.Assert.fail;
 
 import static org.junit.Assume.assumeTrue;
 
-import android.Manifest;
 import android.app.AppOpsManager;
 import android.content.ContentResolver;
 import android.database.Cursor;
@@ -71,7 +74,6 @@ import android.system.Os;
 import android.system.OsConstants;
 import android.util.Log;
 
-import androidx.annotation.Nullable;
 import androidx.test.runner.AndroidJUnit4;
 
 import com.android.cts.install.lib.TestApp;
@@ -80,6 +82,7 @@ import com.android.tests.fused.lib.ReaddirTestHelper;
 import com.google.common.io.ByteStreams;
 
 import org.junit.Before;
+import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
@@ -134,6 +137,8 @@ public class FilePathAccessTest {
             "com.android.tests.fused.testapp.B", 1, false, "TestAppB.apk");
     private static final String[] SYSTEM_GALERY_APPOPS = { AppOpsManager.OPSTR_WRITE_MEDIA_IMAGES,
             AppOpsManager.OPSTR_WRITE_MEDIA_VIDEO };
+    //TODO(b/150115615): used AppOpsManager#OPSTR_MANAGE_EXTERNAL_STORAGE once it's public API
+    private static final String OPSTR_MANAGE_EXTERNAL_STORAGE = "android:manage_external_storage";
 
     @Before
     public void setUp() throws Exception {
@@ -661,6 +666,7 @@ public class FilePathAccessTest {
     /**
      * Test that readdir lists unsupported file types in default directories.
      */
+    @Ignore("Re-enable as part of b/145737191")
     @Test
     public void testListUnsupportedFileType() throws Exception {
         final File pdfFile = new File(DCIM_DIR, NONMEDIA_FILE_NAME);
@@ -967,6 +973,7 @@ public class FilePathAccessTest {
         }
     }
 
+    @Ignore("Re-enable as part of b/145737191")
     @Test
     public void testSystemGalleryCanRenameImagesAndVideos() throws Exception {
         final File otherAppVideoFile = new File(DCIM_DIR, "other_" + VIDEO_FILE_NAME);
@@ -989,21 +996,19 @@ public class FilePathAccessTest {
             assertFileContent(otherAppVideoFile, BYTES_DATA1);
 
             // Assert we can rename the file and ensure the file has the same content
-            assertThat(otherAppVideoFile.renameTo(videoFile)).isTrue();
-            assertThat(otherAppVideoFile.exists()).isFalse();
+            assertCanRenameFile(otherAppVideoFile, videoFile);
             assertFileContent(videoFile, BYTES_DATA1);
             // We can even move it to the top level directory
-            assertThat(videoFile.renameTo(topLevelVideoFile)).isTrue();
-            assertThat(videoFile.exists()).isFalse();
+            assertCanRenameFile(videoFile, topLevelVideoFile);
             assertFileContent(topLevelVideoFile, BYTES_DATA1);
             // And we can even convert it into an image file, because why not?
-            assertThat(topLevelVideoFile.renameTo(imageFile)).isTrue();
-            assertThat(topLevelVideoFile.exists()).isFalse();
+            assertCanRenameFile(topLevelVideoFile, imageFile);
             assertFileContent(imageFile, BYTES_DATA1);
 
-            // However, we can't convert it to a music file, because system gallery has full access
-            // to images and video only
-            assertThat(imageFile.renameTo(musicFile)).isFalse();
+            // We can convert it to a music file, but we won't have access to music file after
+            // renaming.
+            assertThat(imageFile.renameTo(musicFile)).isTrue();
+            assertThat(getFileRowIdFromDatabase(musicFile)).isEqualTo(-1);
         } finally {
             deleteFileAsNoThrow(TEST_APP_A, otherAppVideoFile.getAbsolutePath());
             uninstallApp(TEST_APP_A);
@@ -1253,13 +1258,14 @@ public class FilePathAccessTest {
         }
     }
 
+    @Ignore("Re-enable as part of b/145737191")
     @Test
     public void testManageExternalStorageCanCreateFilesAnywhere() throws Exception {
         final File topLevelPdf = new File(EXTERNAL_STORAGE_DIR, NONMEDIA_FILE_NAME);
         final File musicFileInMovies = new File(MOVIES_DIR, MUSIC_FILE_NAME);
         final File imageFileInDcim = new File(DCIM_DIR, IMAGE_FILE_NAME);
         try {
-            adoptShellPermissionIdentity(Manifest.permission.MANAGE_EXTERNAL_STORAGE);
+            allowAppOpsToUid(Process.myUid(), OPSTR_MANAGE_EXTERNAL_STORAGE);
             // Nothing special about this, anyone can create an image file in DCIM
             assertCanCreateFile(imageFileInDcim);
             // This is where we see the special powers of MANAGE_EXTERNAL_STORAGE, because it can
@@ -1268,7 +1274,7 @@ public class FilePathAccessTest {
             // It can even create a music file in Pictures
             assertCanCreateFile(musicFileInMovies);
         } finally {
-            dropShellPermissionIdentity();
+            denyAppOpsToUid(Process.myUid(), OPSTR_MANAGE_EXTERNAL_STORAGE);
         }
     }
 
@@ -1293,6 +1299,7 @@ public class FilePathAccessTest {
         }
     }
 
+    @Ignore("Re-enable as part of b/145737191")
     @Test
     public void testManageExternalStorageCanDeleteOtherAppsContents() throws Exception {
         final File otherAppPdf = new File(DOWNLOAD_DIR, "other" + NONMEDIA_FILE_NAME);
@@ -1306,9 +1313,7 @@ public class FilePathAccessTest {
             assertThat(createFileAs(TEST_APP_A, otherAppImage.getPath())).isTrue();
             assertThat(createFileAs(TEST_APP_A, otherAppMusic.getPath())).isTrue();
 
-            // Now we get the permission, since some earlier method calls drop shell permission
-            // identity.
-            adoptShellPermissionIdentity(Manifest.permission.MANAGE_EXTERNAL_STORAGE);
+            allowAppOpsToUid(Process.myUid(), OPSTR_MANAGE_EXTERNAL_STORAGE);
 
             assertThat(otherAppPdf.delete()).isTrue();
             assertThat(otherAppPdf.exists()).isFalse();
@@ -1319,7 +1324,7 @@ public class FilePathAccessTest {
             assertThat(otherAppMusic.delete()).isTrue();
             assertThat(otherAppMusic.exists()).isFalse();
         } finally {
-            dropShellPermissionIdentity();
+            denyAppOpsToUid(Process.myUid(), OPSTR_MANAGE_EXTERNAL_STORAGE);
             deleteFileAsNoThrow(TEST_APP_A, otherAppPdf.getAbsolutePath());
             deleteFileAsNoThrow(TEST_APP_A, otherAppImage.getAbsolutePath());
             deleteFileAsNoThrow(TEST_APP_A, otherAppMusic.getAbsolutePath());
@@ -1327,6 +1332,7 @@ public class FilePathAccessTest {
         }
     }
 
+    @Ignore("Re-enable as part of b/145737191")
     @Test
     public void testManageExternalStorageCanRenameOtherAppsContents() throws Exception {
         final File otherAppPdf = new File(DOWNLOAD_DIR, "other" + NONMEDIA_FILE_NAME);
@@ -1341,9 +1347,7 @@ public class FilePathAccessTest {
             assertThat(createFileAs(TEST_APP_A, otherAppPdf.getPath())).isTrue();
             assertThat(otherAppPdf.exists()).isTrue();
 
-            // Now we get the permission, since some earlier method calls drop shell permission
-            // identity.
-            adoptShellPermissionIdentity(Manifest.permission.MANAGE_EXTERNAL_STORAGE);
+            allowAppOpsToUid(Process.myUid(), OPSTR_MANAGE_EXTERNAL_STORAGE);
 
             // Write some data to the file
             try (final FileOutputStream fos = new FileOutputStream(otherAppPdf)) {
@@ -1352,30 +1356,25 @@ public class FilePathAccessTest {
             assertFileContent(otherAppPdf, BYTES_DATA1);
 
             // Assert we can rename the file and ensure the file has the same content
-            assertThat(otherAppPdf.renameTo(pdf)).isTrue();
-            assertThat(otherAppPdf.exists()).isFalse();
+            assertCanRenameFile(otherAppPdf, pdf);
             assertFileContent(pdf, BYTES_DATA1);
             // We can even move it to the top level directory
-            assertThat(pdf.renameTo(topLevelPdf)).isTrue();
-            assertThat(pdf.exists()).isFalse();
+            assertCanRenameFile(pdf, topLevelPdf);
             assertFileContent(topLevelPdf, BYTES_DATA1);
             // And even rename to a place where PDFs don't belong, because we're an omnipotent
             // external storage manager
-            assertThat(topLevelPdf.renameTo(pdfInObviouslyWrongPlace)).isTrue();
-            assertThat(topLevelPdf.exists()).isFalse();
+            assertCanRenameFile(topLevelPdf, pdfInObviouslyWrongPlace);
             assertFileContent(pdfInObviouslyWrongPlace, BYTES_DATA1);
 
             // And we can even convert it into a music file, because why not?
-            assertThat(pdfInObviouslyWrongPlace.renameTo(musicFile)).isTrue();
-            assertThat(pdfInObviouslyWrongPlace.exists()).isFalse();
+            assertCanRenameFile(pdfInObviouslyWrongPlace, musicFile);
             assertFileContent(musicFile, BYTES_DATA1);
-
         } finally {
             pdf.delete();
             pdfInObviouslyWrongPlace.delete();
             topLevelPdf.delete();
             musicFile.delete();
-            dropShellPermissionIdentity();
+            denyAppOpsToUid(Process.myUid(), OPSTR_MANAGE_EXTERNAL_STORAGE);
             deleteFileAsNoThrow(TEST_APP_A, otherAppPdf.getAbsolutePath());
             uninstallApp(TEST_APP_A);
         }
@@ -1406,13 +1405,13 @@ public class FilePathAccessTest {
 
             // Once the test has permission to manage external storage, it can query for other apps'
             // files and open them for read and write
-            adoptShellPermissionIdentity(Manifest.permission.MANAGE_EXTERNAL_STORAGE);
+            allowAppOpsToUid(Process.myUid(), OPSTR_MANAGE_EXTERNAL_STORAGE);
 
             assertCanQueryAndOpenFile(otherAppPdf, "rw");
             assertCanQueryAndOpenFile(otherAppImg, "rw");
             assertCanQueryAndOpenFile(otherAppMusic, "rw");
         } finally {
-            dropShellPermissionIdentity();
+            denyAppOpsToUid(Process.myUid(), OPSTR_MANAGE_EXTERNAL_STORAGE);
             deleteFilesAs(TEST_APP_A, otherAppImg, otherAppMusic, otherAppPdf);
             uninstallApp(TEST_APP_A);
         }
@@ -1458,6 +1457,57 @@ public class FilePathAccessTest {
             denyAppOpsToUid(Process.myUid(), SYSTEM_GALERY_APPOPS);
             deleteFilesAs(TEST_APP_A, otherAppImg, otherAppMusic, otherAppPdf);
             uninstallApp(TEST_APP_A);
+        }
+    }
+
+    /**
+     * Test that System Gallery app can rename any directory under the default directories
+     * designated for images and videos, even if they contain other apps' contents that
+     * System Gallery doesn't have read access to.
+     */
+    @Test
+    public void testSystemGalleryCanRenameImageAndVideoDirs() throws Exception {
+        final File dirInDcim = new File(DCIM_DIR, TEST_DIRECTORY_NAME);
+        final File dirInPictures = new File(PICTURES_DIR, TEST_DIRECTORY_NAME);
+        final File dirInPodcasts = new File(PODCASTS_DIR, TEST_DIRECTORY_NAME);
+        final File otherAppImageFile1 = new File(dirInDcim, "other_" + IMAGE_FILE_NAME);
+        final File otherAppVideoFile1 = new File(dirInDcim, "other_" + VIDEO_FILE_NAME);
+        final File otherAppPdfFile1 = new File(dirInDcim, "other_" + NONMEDIA_FILE_NAME);
+        final File otherAppImageFile2 = new File(dirInPictures, "other_" + IMAGE_FILE_NAME);
+        final File otherAppVideoFile2 = new File(dirInPictures, "other_" + VIDEO_FILE_NAME);
+        final File otherAppPdfFile2 = new File(dirInPictures, "other_" + NONMEDIA_FILE_NAME);
+        try {
+            assertThat(dirInDcim.mkdir()).isTrue();
+
+            executeShellCommand("touch " + otherAppPdfFile1);
+
+            installApp(TEST_APP_A, true);
+            allowAppOpsToUid(Process.myUid(), SYSTEM_GALERY_APPOPS);
+
+            assertCreateFilesAs(TEST_APP_A, otherAppImageFile1, otherAppVideoFile1);
+
+            // System gallery privileges don't go beyond DCIM, Movies and Pictures boundaries.
+            assertCantRenameDirectory(dirInDcim, dirInPodcasts, /*oldFilesList*/null);
+
+            // Rename should succeed, but System Gallery still can't access that PDF file!
+            assertCanRenameDirectory(dirInDcim, dirInPictures,
+                    new File[] {otherAppImageFile1, otherAppVideoFile1},
+                    new File[] {otherAppImageFile2, otherAppVideoFile2});
+            assertThat(getFileRowIdFromDatabase(otherAppPdfFile1)).isEqualTo(-1);
+            assertThat(getFileRowIdFromDatabase(otherAppPdfFile2)).isEqualTo(-1);
+        } finally {
+            executeShellCommand("rm " + otherAppPdfFile1);
+            executeShellCommand("rm " + otherAppPdfFile2);
+            otherAppImageFile1.delete();
+            otherAppImageFile2.delete();
+            otherAppVideoFile1.delete();
+            otherAppVideoFile2.delete();
+            otherAppPdfFile1.delete();
+            otherAppPdfFile2.delete();
+            dirInDcim.delete();
+            dirInPictures.delete();
+            uninstallAppNoThrow(TEST_APP_A);
+            denyAppOpsToUid(Process.myUid(), SYSTEM_GALERY_APPOPS);
         }
     }
 
@@ -1539,46 +1589,6 @@ public class FilePathAccessTest {
         } else {
             Log.w(TAG, "Couldn't assertCanCreateFile(" + file + ") because file existed prior to "
                     + "running the test!");
-        }
-    }
-
-    private static void assertCanRenameFile(File oldFile, File newFile) {
-        assertThat(oldFile.renameTo(newFile)).isTrue();
-        assertThat(oldFile.exists()).isFalse();
-        assertThat(newFile.exists()).isTrue();
-        assertThat(getFileRowIdFromDatabase(oldFile)).isEqualTo(-1);
-        assertThat(getFileRowIdFromDatabase(newFile)).isNotEqualTo(-1);
-    }
-
-    private static void assertCantRenameFile(File oldFile, File newFile) {
-        final int rowId = getFileRowIdFromDatabase(oldFile);
-        assertThat(oldFile.renameTo(newFile)).isFalse();
-        assertThat(oldFile.exists()).isTrue();
-        assertThat(getFileRowIdFromDatabase(oldFile)).isEqualTo(rowId);
-    }
-
-    private static void assertCanRenameDirectory(File oldDirectory, File newDirectory,
-            @Nullable File[] oldFilesList, @Nullable File[] newFilesList) {
-        assertThat(oldDirectory.renameTo(newDirectory)).isTrue();
-        assertThat(oldDirectory.exists()).isFalse();
-        assertThat(newDirectory.exists()).isTrue();
-        for (File file  : oldFilesList != null ? oldFilesList : new File[0]) {
-            assertThat(file.exists()).isFalse();
-            assertThat(getFileRowIdFromDatabase(file)).isEqualTo(-1);
-        }
-        for (File file : newFilesList != null ? newFilesList : new File[0]) {
-            assertThat(file.exists()).isTrue();
-            assertThat(getFileRowIdFromDatabase(file)).isNotEqualTo(-1);
-        };
-    }
-
-    private static void assertCantRenameDirectory(File oldDirectory, File newDirectory,
-            @Nullable File[] oldFilesList) {
-        assertThat(oldDirectory.renameTo(newDirectory)).isFalse();
-        assertThat(oldDirectory.exists()).isTrue();
-        for (File file  : oldFilesList != null ? oldFilesList : new File[0]) {
-            assertThat(file.exists()).isTrue();
-            assertThat(getFileRowIdFromDatabase(file)).isNotEqualTo(-1);
         }
     }
 
