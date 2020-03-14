@@ -162,6 +162,7 @@ import androidx.annotation.Nullable;
 import androidx.annotation.VisibleForTesting;
 
 import com.android.providers.media.DatabaseHelper.OnFilesChangeListener;
+import com.android.providers.media.DatabaseHelper.OnLegacyMigrationListener;
 import com.android.providers.media.fuse.ExternalStorageServiceImpl;
 import com.android.providers.media.fuse.FuseDaemon;
 import com.android.providers.media.scan.MediaScanner;
@@ -171,6 +172,7 @@ import com.android.providers.media.util.BackgroundThread;
 import com.android.providers.media.util.CachedSupplier;
 import com.android.providers.media.util.DatabaseUtils;
 import com.android.providers.media.util.FileUtils;
+import com.android.providers.media.util.ForegroundThread;
 import com.android.providers.media.util.IsoInterface;
 import com.android.providers.media.util.Logging;
 import com.android.providers.media.util.LongArray;
@@ -198,7 +200,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
@@ -475,7 +476,7 @@ public class MediaProvider extends ContentProvider {
         @Override
         public void onInsert(@NonNull DatabaseHelper helper, @NonNull String volumeName, long id,
                 int mediaType, boolean isDownload) {
-            acceptWithExpansion(helper::notifyChange, volumeName, id, mediaType, isDownload);
+            acceptWithExpansion(helper::notifyInsert, volumeName, id, mediaType, isDownload);
 
             if (helper.isExternal()) {
                 // Update the quota type on the filesystem
@@ -492,7 +493,7 @@ public class MediaProvider extends ContentProvider {
                 int oldMediaType, boolean oldIsDownload,
                 int newMediaType, boolean newIsDownload) {
             final boolean isDownload = oldIsDownload || newIsDownload;
-            acceptWithExpansion(helper::notifyChange, volumeName, id, oldMediaType, isDownload);
+            acceptWithExpansion(helper::notifyUpdate, volumeName, id, oldMediaType, isDownload);
 
             // When media type changes, notify both old and new collections and
             // invalidate any thumbnails
@@ -501,7 +502,7 @@ public class MediaProvider extends ContentProvider {
                 if (helper.isExternal()) {
                     updateQuotaTypeForUri(fileUri, newMediaType);
                 }
-                acceptWithExpansion(helper::notifyChange, volumeName, id, newMediaType, isDownload);
+                acceptWithExpansion(helper::notifyUpdate, volumeName, id, newMediaType, isDownload);
                 invalidateThumbnails(fileUri);
             }
         }
@@ -512,7 +513,7 @@ public class MediaProvider extends ContentProvider {
             // Both notify apps and revoke any outstanding permission grants
             final Context context = getContext();
             acceptWithExpansion((uri) -> {
-                helper.notifyChange(uri);
+                helper.notifyDelete(uri);
                 context.revokeUriPermission(uri, ~0);
             }, volumeName, id, mediaType, isDownload);
 
@@ -521,6 +522,18 @@ public class MediaProvider extends ContentProvider {
 
             // Tell our SAF provider so it can revoke too
             MediaDocumentsProvider.onMediaStoreDelete(getContext(), volumeName, mediaType, id);
+        }
+    };
+
+    private final OnLegacyMigrationListener mMigrationListener = new OnLegacyMigrationListener() {
+        @Override
+        public void onStarted(ContentProviderClient client, String volumeName) {
+            MediaStore.startLegacyMigration(ContentResolver.wrap(client), volumeName);
+        }
+
+        @Override
+        public void onFinished(ContentProviderClient client, String volumeName) {
+            MediaStore.finishLegacyMigration(ContentResolver.wrap(client), volumeName);
         }
     };
 
@@ -583,6 +596,8 @@ public class MediaProvider extends ContentProvider {
             Environment.DIRECTORY_MOVIES,
             Environment.DIRECTORY_DOWNLOADS,
             Environment.DIRECTORY_DCIM,
+            Environment.DIRECTORY_AUDIOBOOKS,
+            Environment.DIRECTORY_DOCUMENTS,
     };
 
     private static boolean isDefaultDirectoryName(@Nullable String dirName) {
@@ -671,10 +686,10 @@ public class MediaProvider extends ContentProvider {
 
         mInternalDatabase = new DatabaseHelper(context, INTERNAL_DATABASE_NAME,
                 true, false, mLegacyProvider, Column.class,
-                Metrics::logSchemaChange, mFilesListener);
+                Metrics::logSchemaChange, mFilesListener, mMigrationListener);
         mExternalDatabase = new DatabaseHelper(context, EXTERNAL_DATABASE_NAME,
                 false, false, mLegacyProvider, Column.class,
-                Metrics::logSchemaChange, mFilesListener);
+                Metrics::logSchemaChange, mFilesListener, mMigrationListener);
 
         final IntentFilter filter = new IntentFilter();
         filter.setPriority(10);
@@ -1909,6 +1924,7 @@ public class MediaProvider extends ContentProvider {
                 defaultPrimary = Environment.DIRECTORY_MUSIC;
                 allowedPrimary = Arrays.asList(
                         Environment.DIRECTORY_ALARMS,
+                        Environment.DIRECTORY_AUDIOBOOKS,
                         Environment.DIRECTORY_MUSIC,
                         Environment.DIRECTORY_NOTIFICATIONS,
                         Environment.DIRECTORY_PODCASTS,
@@ -3860,15 +3876,8 @@ public class MediaProvider extends ContentProvider {
     private Bundle callInternal(String method, String arg, Bundle extras) {
         switch (method) {
             case MediaStore.WAIT_FOR_IDLE_CALL: {
-                final CountDownLatch latch = new CountDownLatch(1);
-                BackgroundThread.getExecutor().execute(() -> {
-                    latch.countDown();
-                });
-                try {
-                    latch.await(30, TimeUnit.SECONDS);
-                } catch (InterruptedException e) {
-                    throw new IllegalStateException(e);
-                }
+                ForegroundThread.waitForIdle();
+                BackgroundThread.waitForIdle();
                 return null;
             }
             case MediaStore.SCAN_FILE_CALL:
