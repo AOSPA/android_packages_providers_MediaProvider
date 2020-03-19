@@ -19,6 +19,7 @@
 #include "FuseDaemon.h"
 
 #include <android-base/logging.h>
+#include <android-base/properties.h>
 #include <android/log.h>
 #include <android/trace.h>
 #include <ctype.h>
@@ -75,7 +76,7 @@ using std::vector;
 
 // logging macros to avoid duplication.
 #define TRACE_NODE(__node) \
-    LOG(DEBUG) << __FUNCTION__ << " : " << #__node << " = [" << safe_name(__node) << "] "
+    LOG(VERBOSE) << __FUNCTION__ << " : " << #__node << " = [" << get_name(__node) << "] "
 
 #define ATRACE_NAME(name) ScopedTrace ___tracer(name)
 #define ATRACE_CALL() ATRACE_NAME(__FUNCTION__)
@@ -90,6 +91,8 @@ class ScopedTrace {
       ATrace_endSection();
     }
 };
+
+const bool IS_OS_DEBUGABLE = android::base::GetIntProperty("ro.debuggable", 0);
 
 #define FUSE_UNKNOWN_INO 0xffffffff
 
@@ -287,10 +290,19 @@ struct fuse {
     /* const */ char* zero_addr;
 
     FAdviser fadviser;
+
+    std::atomic_bool* active;
 };
 
-static inline string safe_name(node* n) {
-    return n ? n->BuildSafePath() : "?";
+static inline string get_name(node* n) {
+    if (n) {
+        std::string name("node_path: " + n->BuildSafePath());
+        if (IS_OS_DEBUGABLE) {
+            name += " real_path: " + n->BuildPath();
+        }
+        return name;
+    }
+    return "?";
 }
 
 static inline __u64 ptr_to_id(void* ptr) {
@@ -423,6 +435,9 @@ static void pf_init(void* userdata, struct fuse_conn_info* conn) {
                      FUSE_CAP_EXPORT_SUPPORT | FUSE_CAP_FLOCK_LOCKS);
     conn->want |= conn->capable & mask;
     conn->max_read = MAX_READ_SIZE;
+
+    struct fuse* fuse = reinterpret_cast<struct fuse*>(userdata);
+    fuse->active->store(true, std::memory_order_release);
 }
 
 static void pf_destroy(void* userdata) {
@@ -788,6 +803,29 @@ static void pf_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t new_parent,
 }
 */
 
+static handle* create_handle_for_node(struct fuse* fuse, const string& path, int fd, node* node,
+                                      const RedactionInfo* ri) {
+    std::lock_guard<std::recursive_mutex> guard(fuse->lock);
+    // We don't want to use the FUSE VFS cache in two cases:
+    // 1. When redaction is needed because app A with EXIF access might access
+    // a region that should have been redacted for app B without EXIF access, but app B on
+    // a subsequent read, will be able to see the EXIF data because the read request for
+    // that region will be served from cache and not get to the FUSE daemon
+    // 2. When the file has a read or write lock on it. This means that the MediaProvider
+    // has given an fd to the lower file system to an app. There are two cases where using
+    // the cache in this case can be a problem:
+    // a. Writing to a FUSE fd with caching enabled will use the write-back cache and a
+    // subsequent read from the lower fs fd will not see the write.
+    // b. Reading from a FUSE fd with caching enabled may not see the latest writes using
+    // the lower fs fd because those writes did not go through the FUSE layer and reads from
+    // FUSE after that write may be served from cache
+    bool direct_io = ri->isRedactionNeeded() || is_file_locked(fd, path);
+
+    handle* h = new handle(path, fd, ri, /*owner_uid*/ -1, !direct_io);
+    node->AddHandle(h);
+    return h;
+}
+
 static void pf_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi) {
     ATRACE_CALL();
     struct fuse* fuse = get_fuse(req);
@@ -841,33 +879,10 @@ static void pf_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi) {
         return;
     }
 
-    handle* h = nullptr;
-    {
-        std::lock_guard<std::recursive_mutex> guard(fuse->lock);
-
-        if (ri->isRedactionNeeded() || is_file_locked(fd, path)) {
-            // We don't want to use the FUSE VFS cache in two cases:
-            // 1. When redaction is needed because app A with EXIF access might access
-            // a region that should have been redacted for app B without EXIF access, but app B on
-            // a subsequent read, will be able to see the EXIF data because the read request for
-            // that region will be served from cache and not get to the FUSE daemon
-            // 2. When the file has a read or write lock on it. This means that the MediaProvider
-            // has given an fd to the lower file system to an app. There are two cases where using
-            // the cache in this case can be a problem:
-            // a. Writing to a FUSE fd with caching enabled will use the write-back cache and a
-            // subsequent read from the lower fs fd will not see the write.
-            // b. Reading from a FUSE fd with caching enabled may not see the latest writes using
-            // the lower fs fd because those writes did not go through the FUSE layer and reads from
-            // FUSE after that write may be served from cache
-            fi->direct_io = true;
-        }
-
-        h = new handle(path, fd, ri.release(), /*owner_uid*/ -1, !fi->direct_io);
-        node->AddHandle(h);
-    }
-
+    handle* h = create_handle_for_node(fuse, path, fd, node, ri.release());
     fi->fh = ptr_to_id(h);
     fi->keep_cache = 1;
+    fi->direct_io = !h->cached;
     fuse_reply_open(req, fi);
 }
 
@@ -1346,25 +1361,25 @@ static void pf_create(fuse_req_t req,
         return;
     }
 
-    // TODO(b/147274248): Assume there will be no EXIF to redact.
-    // This prevents crashing during reads but can be a security hole if a malicious app opens an fd
-    // to the file before all the EXIF content is written. We could special case reads before the
-    // first close after a file has just been created.
-    handle* h = new handle(child_path, fd, new RedactionInfo(), ctx->uid, /*cached*/ true);
-    fi->fh = ptr_to_id(h);
-    fi->keep_cache = 1;
-
     int error_code = 0;
     struct fuse_entry_param e;
     node* node = make_node_entry(req, parent_node, name, child_path, &e, &error_code);
     TRACE_NODE(node);
-    if (node) {
-        node->AddHandle(h);
-        fuse_reply_create(req, &e, fi);
-    } else {
+    if (!node) {
         CHECK(error_code != 0);
         fuse_reply_err(req, error_code);
+        return;
     }
+
+    // TODO(b/147274248): Assume there will be no EXIF to redact.
+    // This prevents crashing during reads but can be a security hole if a malicious app opens an fd
+    // to the file before all the EXIF content is written. We could special case reads before the
+    // first close after a file has just been created.
+    handle* h = create_handle_for_node(fuse, child_path, fd, node, new RedactionInfo());
+    fi->fh = ptr_to_id(h);
+    fi->keep_cache = 1;
+    fi->direct_io = !h->cached;
+    fuse_reply_create(req, &e, fi);
 }
 /*
 static void pf_getlk(fuse_req_t req, fuse_ino_t ino,
@@ -1516,6 +1531,10 @@ void FuseDaemon::InvalidateFuseDentryCache(const std::string& path) {
 FuseDaemon::FuseDaemon(JNIEnv* env, jobject mediaProvider) : mp(env, mediaProvider),
                                                              active(false), fuse(nullptr) {}
 
+bool FuseDaemon::IsStarted() const {
+    return active.load(std::memory_order_acquire);
+}
+
 void FuseDaemon::Start(const int fd, const std::string& path) {
     struct fuse_args args;
     struct fuse_cmdline_opts opts;
@@ -1556,8 +1575,6 @@ void FuseDaemon::Start(const int fd, const std::string& path) {
         LOG(FATAL) << "mmap failed - could not start fuse! errno = " << errno;
     }
 
-    umask(0);
-
     // Custom logging for libfuse
     fuse_set_log_func(fuse_logger);
 
@@ -1568,6 +1585,7 @@ void FuseDaemon::Start(const int fd, const std::string& path) {
         return;
     }
     fuse_default.se = se;
+    fuse_default.active = &active;
     se->fd = fd;
     se->mountpoint = strdup(path.c_str());
 
@@ -1575,8 +1593,8 @@ void FuseDaemon::Start(const int fd, const std::string& path) {
     // fuse_session_loop(se);
     // Multi-threaded
     LOG(INFO) << "Starting fuse...";
-    active.store(true, std::memory_order_release);
     fuse_session_loop_mt(se, &config);
+    fuse->active->store(false, std::memory_order_release);
     LOG(INFO) << "Ending fuse...";
 
     if (munmap(fuse_default.zero_addr, MAX_READ_SIZE)) {
@@ -1585,7 +1603,6 @@ void FuseDaemon::Start(const int fd, const std::string& path) {
 
     fuse_opt_free_args(&args);
     fuse_session_destroy(se);
-    active.store(false, std::memory_order_relaxed);
     LOG(INFO) << "Ended fuse";
     return;
 }
