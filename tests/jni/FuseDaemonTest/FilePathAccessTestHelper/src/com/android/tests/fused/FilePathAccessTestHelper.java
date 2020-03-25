@@ -22,7 +22,12 @@ import static com.android.tests.fused.lib.TestUtils.CREATE_FILE_QUERY;
 import static com.android.tests.fused.lib.TestUtils.DELETE_FILE_QUERY;
 import static com.android.tests.fused.lib.TestUtils.INTENT_EXCEPTION;
 import static com.android.tests.fused.lib.TestUtils.INTENT_EXTRA_PATH;
+import static com.android.tests.fused.lib.TestUtils.OPEN_FILE_FOR_READ_QUERY;
+import static com.android.tests.fused.lib.TestUtils.OPEN_FILE_FOR_WRITE_QUERY;
 import static com.android.tests.fused.lib.TestUtils.QUERY_TYPE;
+import static com.android.tests.fused.lib.TestUtils.canOpenWithMediaProvider;
+import static com.android.tests.fused.lib.TestUtils.canOpen;
+import static com.android.tests.fused.lib.TestUtils.setContext;
 
 import android.app.Activity;
 import android.content.Intent;
@@ -46,6 +51,7 @@ public class FilePathAccessTestHelper extends Activity {
     @Override
     public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        setContext(this);
         String queryType = getIntent().getStringExtra(QUERY_TYPE);
         queryType = queryType == null ? "null" : queryType;
         switch (queryType) {
@@ -54,7 +60,9 @@ public class FilePathAccessTestHelper extends Activity {
                 break;
             case CREATE_FILE_QUERY:
             case DELETE_FILE_QUERY:
-                createOrDeleteFile(queryType);
+            case OPEN_FILE_FOR_READ_QUERY:
+            case OPEN_FILE_FOR_WRITE_QUERY:
+                accessFile(queryType);
                 break;
             case EXIF_METADATA_QUERY:
                 sendMetadata(queryType);
@@ -99,7 +107,7 @@ public class FilePathAccessTestHelper extends Activity {
         }
     }
 
-    private void createOrDeleteFile(String queryType) {
+    private void accessFile(String queryType) {
         if (getIntent().hasExtra(INTENT_EXTRA_PATH)) {
             final String filePath = getIntent().getStringExtra(INTENT_EXTRA_PATH);
             final File file = new File(filePath);
@@ -109,9 +117,15 @@ public class FilePathAccessTestHelper extends Activity {
                     returnStatus = file.createNewFile();
                 } else if (queryType.equals(DELETE_FILE_QUERY)) {
                     returnStatus = file.delete();
+                } else if (queryType.equals(OPEN_FILE_FOR_READ_QUERY)) {
+                    returnStatus = canOpen(file, /* forWrite */ false)
+                            && canOpenWithMediaProvider(file, /* forWrite */ false);
+                } else if (queryType.equals(OPEN_FILE_FOR_WRITE_QUERY)) {
+                    returnStatus = canOpen(file, /* forWrite */ true)
+                            && canOpenWithMediaProvider(file, /* forWrite */ true);
                 }
             } catch(IOException e) {
-                Log.e(TAG, "IOException occurred while creating/deleting " + filePath);
+                Log.e(TAG, "Failed to access file: " + filePath + ". Query type: " + queryType, e);
             }
             final Intent intent = new Intent(queryType);
             intent.putExtra(queryType, returnStatus);
