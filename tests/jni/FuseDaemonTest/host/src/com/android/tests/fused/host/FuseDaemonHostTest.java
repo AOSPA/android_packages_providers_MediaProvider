@@ -24,6 +24,7 @@ import com.android.tradefed.testtype.junit4.BaseHostJUnit4Test;
 
 import org.junit.After;
 import org.junit.Before;
+import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
@@ -48,14 +49,13 @@ public class FuseDaemonHostTest extends BaseHostJUnit4Test {
 
     @Before
     public void setup() throws Exception {
-        executeShellCommand("mkdir /sdcard/Android/data/com.android.shell");
-        executeShellCommand("mkdir /sdcard/Android/data/com.android.shell/files");
+        executeShellCommand("mkdir /sdcard/Android/data/com.android.shell -m 2770");
+        executeShellCommand("mkdir /sdcard/Android/data/com.android.shell/files -m 2770");
     }
 
     @After
     public void tearDown() throws Exception {
         executeShellCommand("rm -r /sdcard/Android/data/com.android.shell");
-        executeShellCommand("rm -r /sdcard/Android/data/com.android.shell/files");
     }
 
     @Test
@@ -118,6 +118,7 @@ public class FuseDaemonHostTest extends BaseHostJUnit4Test {
         runDeviceTest("testListFilesFromExternalMediaDirectory");
     }
 
+    @Ignore("Re-enable as part of b/145737191")
     @Test
     public void testListUnsupportedFileType() throws Exception {
         final ITestDevice device = getDevice();
@@ -194,21 +195,25 @@ public class FuseDaemonHostTest extends BaseHostJUnit4Test {
         runDeviceTest("testSystemGalleryAppHasNoFullAccessToAudio");
     }
 
+    @Ignore("Re-enable as part of b/145737191")
     @Test
     public void testSystemGalleryCanRenameImagesAndVideos() throws Exception {
         runDeviceTest("testSystemGalleryCanRenameImagesAndVideos");
     }
 
+    @Ignore("Re-enable as part of b/145737191")
     @Test
     public void testManageExternalStorageCanCreateFilesAnywhere() throws Exception {
         runDeviceTest("testManageExternalStorageCanCreateFilesAnywhere");
     }
 
+    @Ignore("Re-enable as part of b/145737191")
     @Test
     public void testManageExternalStorageCanDeleteOtherAppsContents() throws Exception {
         runDeviceTest("testManageExternalStorageCanDeleteOtherAppsContents");
     }
 
+    @Ignore("Re-enable as part of b/145737191")
     @Test
     public void testManageExternalStorageCanRenameOtherAppsContents() throws Exception {
         runDeviceTest("testManageExternalStorageCanRenameOtherAppsContents");
@@ -242,5 +247,10 @@ public class FuseDaemonHostTest extends BaseHostJUnit4Test {
     @Test
     public void testQueryOtherAppsFiles() throws Exception {
         runDeviceTest("testQueryOtherAppsFiles");
+    }
+
+    @Test
+    public void testSystemGalleryCanRenameImageAndVideoDirs() throws Exception {
+        runDeviceTest("testSystemGalleryCanRenameImageAndVideoDirs");
     }
 }

@@ -16,10 +16,17 @@
 
 package com.android.tests.fused.legacy;
 
+import static com.android.tests.fused.lib.TestUtils.BYTES_DATA1;
+import static com.android.tests.fused.lib.TestUtils.BYTES_DATA2;
+import static com.android.tests.fused.lib.TestUtils.STR_DATA1;
+import static com.android.tests.fused.lib.TestUtils.STR_DATA2;
+import static com.android.tests.fused.lib.TestUtils.assertCanRenameFile;
+import static com.android.tests.fused.lib.TestUtils.assertCanRenameDirectory;
+import static com.android.tests.fused.lib.TestUtils.assertCantRenameFile;
+import static com.android.tests.fused.lib.TestUtils.assertFileContent;
 import static com.android.tests.fused.lib.TestUtils.createFileAs;
-
-
 import static com.android.tests.fused.lib.TestUtils.deleteFileAsNoThrow;
+import static com.android.tests.fused.lib.TestUtils.getContentResolver;
 import static com.android.tests.fused.lib.TestUtils.getFileOwnerPackageFromDatabase;
 import static com.android.tests.fused.lib.TestUtils.getFileRowIdFromDatabase;
 import static com.android.tests.fused.lib.TestUtils.installApp;
@@ -33,11 +40,17 @@ import static com.google.common.truth.Truth.assertThat;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import android.Manifest;
+import android.content.ContentResolver;
+import android.content.ContentValues;
+import android.database.Cursor;
+import android.net.Uri;
 import android.os.Environment;
+import android.provider.MediaStore;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.system.OsConstants;
@@ -49,13 +62,18 @@ import androidx.test.runner.AndroidJUnit4;
 import com.android.cts.install.lib.TestApp;
 import com.android.tests.fused.lib.ReaddirTestHelper;
 
+import com.google.common.io.Files;
+
 import org.junit.Before;
+import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
 import java.io.File;
 import java.io.FileDescriptor;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
 
 /**
@@ -72,6 +90,7 @@ public class LegacyFileAccessTest {
     private static final String TAG = "LegacyFileAccessTest";
     static final String THIS_PACKAGE_NAME = InstrumentationRegistry.getContext().getPackageName();
 
+    static final String IMAGE_FILE_NAME = "FilePathAccessTest_file.jpg";
     static final String VIDEO_FILE_NAME = "LegacyAccessTest_file.mp4";
     static final String NONMEDIA_FILE_NAME = "LegacyAccessTest_file.pdf";
 
@@ -274,6 +293,7 @@ public class LegacyFileAccessTest {
      * Test that rename for legacy app with WRITE_EXTERNAL_STORAGE permission bypasses rename
      * restrictions imposed by MediaProvider
      */
+    @Ignore("Re-enable as part of b/145737191")
     @Test
     public void testCanRename_hasRW() throws Exception {
         pollForPermission(Manifest.permission.READ_EXTERNAL_STORAGE, /*granted*/ true);
@@ -294,16 +314,16 @@ public class LegacyFileAccessTest {
         try {
             // can rename a file to root directory.
             assertThat(musicFile1.createNewFile()).isTrue();
-            assertCanRename(musicFile1, musicFile2);
+            assertCanRenameFile(musicFile1, musicFile2);
 
             // can rename a music file to Movies directory.
-            assertCanRename(musicFile2, musicFile3);
+            assertCanRenameFile(musicFile2, musicFile3);
 
             assertThat(nonMediaDir1.mkdir()).isTrue();
             assertThat(pdfFile1.createNewFile()).isTrue();
             // can rename directory to root directory.
-            assertCanRename(nonMediaDir1, nonMediaDir2);
-            assertThat(pdfFile2.exists()).isTrue();
+            assertCanRenameDirectory(nonMediaDir1, nonMediaDir2, new File[]{pdfFile1},
+                    new File[]{pdfFile2});
         } finally {
             musicFile1.delete();
             musicFile2.delete();
@@ -335,13 +355,14 @@ public class LegacyFileAccessTest {
                 getExternalMediaDirs()[0], "LegacyFileAccessTest2");
         try {
             // app can't rename shell file.
-            assertThat(shellFile1.renameTo(shellFile2)).isFalse();
+            assertCantRenameFile(shellFile1, shellFile2);
             // app can't move shell file to its media directory.
-            assertThat(mediaFile1.renameTo(shellFile1)).isFalse();
+            assertCantRenameFile(shellFile1, mediaFile1);
             // However, even without permissions, app can rename files in its own external media
             // directory.
             assertThat(mediaFile1.createNewFile()).isTrue();
-            assertCanRename(mediaFile1, mediaFile2);
+            assertThat(mediaFile1.renameTo(mediaFile2)).isTrue();
+            assertThat(mediaFile2.exists()).isTrue();
         } finally {
             mediaFile1.delete();
             mediaFile2.delete();
@@ -367,13 +388,14 @@ public class LegacyFileAccessTest {
                 getExternalMediaDirs()[0], "LegacyFileAccessTest2");
         try {
             // app can't rename shell file.
-            assertThat(shellFile1.renameTo(shellFile2)).isFalse();
+            assertCantRenameFile(shellFile1, shellFile2);
             // app can't move shell file to its media directory.
-            assertThat(mediaFile1.renameTo(shellFile1)).isFalse();
+            assertCantRenameFile(shellFile1, mediaFile1);
             // However, even without permissions, app can rename files in its own external media
             // directory.
             assertThat(mediaFile1.createNewFile()).isTrue();
-            assertCanRename(mediaFile1, mediaFile2);
+            assertThat(mediaFile1.renameTo(mediaFile2)).isTrue();
+            assertThat(mediaFile2.exists()).isTrue();
         } finally {
             mediaFile1.delete();
             mediaFile2.delete();
@@ -384,6 +406,7 @@ public class LegacyFileAccessTest {
      * Test that legacy app with WRITE_EXTERNAL_STORAGE can delete all files, and corresponding
      * database entry is deleted on deleting the file.
      */
+    @Ignore("Re-enable as part of b/145737191")
     @Test
     public void testCanDeleteAllFiles_hasRW() throws Exception {
         pollForPermission(Manifest.permission.READ_EXTERNAL_STORAGE, /*granted*/ true);
@@ -423,6 +446,7 @@ public class LegacyFileAccessTest {
      * Test that file created by legacy app is inserted to MediaProvider database. And,
      * MediaColumns.OWNER_PACKAGE_NAME is updated with calling package's name.
      */
+    @Ignore("Re-enable as part of b/145737191")
     @Test
     public void testLegacyAppCanOwnAFile_hasW() throws Exception {
         pollForPermission(Manifest.permission.READ_EXTERNAL_STORAGE, /*granted*/ true);
@@ -449,6 +473,134 @@ public class LegacyFileAccessTest {
             videoFile.delete();
             uninstallApp(TEST_APP_A);
         }
+    }
+
+    /**
+     * b/14966134: Test that FuseDaemon doesn't leave stale database entries after create() and
+     * rename().
+     */
+    @Test
+    public void testCreateAndRenameDoesntLeaveStaleDBRow_hasRW() throws Exception {
+        pollForPermission(Manifest.permission.READ_EXTERNAL_STORAGE, /*granted*/ true);
+        pollForPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE, /*granted*/ true);
+
+        final File directoryDCIM = new File(Environment.getExternalStorageDirectory(),
+                Environment.DIRECTORY_DCIM);
+        final File videoFile = new File(directoryDCIM, VIDEO_FILE_NAME);
+        final File renamedVideoFile = new File(directoryDCIM, "Renamed_" + VIDEO_FILE_NAME);
+        final ContentResolver cr = getContentResolver();
+
+        try {
+            assertThat(videoFile.createNewFile()).isTrue();
+            assertThat(videoFile.renameTo(renamedVideoFile)).isTrue();
+
+            ContentValues values = new ContentValues();
+            values.put(MediaStore.MediaColumns.DATA, renamedVideoFile.getAbsolutePath());
+            // Insert new renamedVideoFile to database
+            final Uri uri = cr.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values, null);
+            assertNotNull(uri);
+
+            // Query for all images/videos in the device.
+            // This shouldn't list videoFile which was renamed to renamedVideoFile.
+            final ArrayList<String> imageAndVideoFiles = getImageAndVideoFilesFromDatabase();
+            assertThat(imageAndVideoFiles).contains(renamedVideoFile.getName());
+            assertThat(imageAndVideoFiles).doesNotContain(videoFile.getName());
+        } finally {
+            videoFile.delete();
+            renamedVideoFile.delete();
+            MediaStore.scanFile(cr, renamedVideoFile);
+        }
+    }
+
+    /**
+     * b/150147690,b/150193381: Test that file rename doesn't delete any existing Uri.
+     */
+    @Test
+    public void testRenameDoesntInvalidateUri_hasRW() throws Exception {
+        pollForPermission(Manifest.permission.READ_EXTERNAL_STORAGE, /*granted*/ true);
+        pollForPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE, /*granted*/ true);
+
+        final File directoryDCIM = new File(Environment.getExternalStorageDirectory(),
+                Environment.DIRECTORY_DCIM);
+        final File imageFile = new File(directoryDCIM, IMAGE_FILE_NAME);
+        final File temporaryImageFile = new File(directoryDCIM, IMAGE_FILE_NAME + "_.tmp");
+        final ContentResolver cr = getContentResolver();
+
+        try {
+            assertThat(imageFile.createNewFile()).isTrue();
+            try (final FileOutputStream fos = new FileOutputStream(imageFile)) {
+                fos.write(BYTES_DATA1);
+            }
+            // Insert this file to database.
+            ContentValues values = new ContentValues();
+            values.put(MediaStore.MediaColumns.DATA, imageFile.getAbsolutePath());
+            final Uri uri = cr.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values, null);
+            assertNotNull(uri);
+
+            Files.copy(imageFile, temporaryImageFile);
+            // Write more bytes to temporaryImageFile
+            try (final FileOutputStream fos = new FileOutputStream(temporaryImageFile, true)) {
+                fos.write(BYTES_DATA2);
+            }
+            assertThat(imageFile.delete()).isTrue();
+            temporaryImageFile.renameTo(imageFile);
+
+            // Previous uri of imageFile is unaltered after delete & rename.
+            final Uri scannedUri = MediaStore.scanFile(cr, imageFile);
+            assertThat(scannedUri.getLastPathSegment()).isEqualTo(uri.getLastPathSegment());
+
+            final byte[] expected = (STR_DATA1 + STR_DATA2).getBytes();
+            assertFileContent(imageFile, expected);
+        } finally {
+            imageFile.delete();
+            temporaryImageFile.delete();
+            MediaStore.scanFile(cr, imageFile);
+        }
+    }
+
+    /**
+     * b/150498564,b/150274099: Test that apps can rename files that are not in database.
+     */
+    @Test
+    public void testCanRenameAFileWithNoDBRow_hasRW() throws Exception {
+        pollForPermission(Manifest.permission.READ_EXTERNAL_STORAGE, /*granted*/ true);
+        pollForPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE, /*granted*/ true);
+
+        final File directoryDCIM = new File(Environment.getExternalStorageDirectory(),
+                Environment.DIRECTORY_DCIM);
+        final File directoryNoMedia = new File(directoryDCIM, ".directoryNoMedia");
+        final File imageInNoMediaDir = new File(directoryNoMedia, IMAGE_FILE_NAME);
+        final File renamedImageInDCIM = new File(directoryDCIM, IMAGE_FILE_NAME);
+        final File noMediaFile = new File(directoryNoMedia, ".nomedia");
+        final ContentResolver cr = getContentResolver();
+
+        try {
+            if (!directoryNoMedia.exists()) {
+                assertThat(directoryNoMedia.mkdirs()).isTrue();
+            }
+            assertThat(noMediaFile.createNewFile()).isTrue();
+            assertThat(imageInNoMediaDir.createNewFile()).isTrue();
+            // Remove imageInNoMediaDir from database.
+            MediaStore.scanFile(cr, directoryNoMedia);
+
+            // Query for all images/videos in the device. This shouldn't list imageInNoMediaDir
+            assertThat(getImageAndVideoFilesFromDatabase())
+                    .doesNotContain(imageInNoMediaDir.getName());
+
+            // Rename shouldn't throw error even if imageInNoMediaDir is not in database.
+            assertThat(imageInNoMediaDir.renameTo(renamedImageInDCIM)).isTrue();
+            // We can insert renamedImageInDCIM to database
+            ContentValues values = new ContentValues();
+            values.put(MediaStore.MediaColumns.DATA, renamedImageInDCIM.getAbsolutePath());
+            final Uri uri = cr.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values, null);
+            assertNotNull(uri);
+        } finally {
+            imageInNoMediaDir.delete();
+            renamedImageInDCIM.delete();
+            MediaStore.scanFile(cr, renamedImageInDCIM);
+            noMediaFile.delete();
+        }
+
     }
 
     private static void assertCanCreateFile(File file) throws IOException {
@@ -481,9 +633,26 @@ public class LegacyFileAccessTest {
         }
     }
 
-    private static void assertCanRename(File oldPath, File newPath) {
-        assertThat(oldPath.renameTo(newPath)).isTrue();
-        assertThat(oldPath.exists()).isFalse();
-        assertThat(newPath.exists()).isTrue();
+    /**
+     * Queries {@link ContentResolver} for all image and video files, returns display name of
+     * corresponding files.
+     */
+    private static ArrayList<String> getImageAndVideoFilesFromDatabase() {
+        ArrayList<String> mediaFiles = new ArrayList<>();
+        final String selection = "is_pending = 0 AND is_trashed = 0 AND "
+                + "(media_type = ? OR media_type = ?)";
+        final String[] selectionArgs = new String[] {
+                String.valueOf(MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE),
+                String.valueOf(MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO)};
+
+        try (Cursor c = getContentResolver().query(
+                MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL),
+                /* projection */ new String[]{MediaStore.MediaColumns.DISPLAY_NAME},
+                selection, selectionArgs, null)) {
+            while (c.moveToNext()) {
+                mediaFiles.add(c.getString(0));
+            }
+        }
+        return mediaFiles;
     }
 }

@@ -43,7 +43,9 @@ import android.os.Environment;
 import android.os.ParcelFileDescriptor;
 import android.os.SystemClock;
 import android.provider.MediaStore;
+import android.system.ErrnoException;
 import android.system.Os;
+import android.system.OsConstants;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
@@ -58,7 +60,10 @@ import com.android.cts.install.lib.Uninstall;
 import com.google.common.io.ByteStreams;
 
 import java.io.File;
+import java.io.FileDescriptor;
 import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.concurrent.CountDownLatch;
@@ -75,6 +80,13 @@ public class TestUtils {
     public static final String INTENT_EXCEPTION = "com.android.tests.fused.exception";
     public static final String CREATE_FILE_QUERY = "com.android.tests.fused.createfile";
     public static final String DELETE_FILE_QUERY = "com.android.tests.fused.deletefile";
+
+
+    public static final String STR_DATA1 = "Just some random text";
+    public static final String STR_DATA2 = "More arbitrary stuff";
+
+    public static final byte[] BYTES_DATA1 = STR_DATA1.getBytes();
+    public static final byte[] BYTES_DATA2 = STR_DATA2.getBytes();
 
     private static final long POLLING_TIMEOUT_MILLIS = TimeUnit.SECONDS.toMillis(10);
     private static final long POLLING_SLEEP_MILLIS = 100;
@@ -404,6 +416,46 @@ public class TestUtils {
         return path.delete();
     }
 
+    public static void assertCanRenameFile(File oldFile, File newFile) {
+        assertThat(oldFile.renameTo(newFile)).isTrue();
+        assertThat(oldFile.exists()).isFalse();
+        assertThat(newFile.exists()).isTrue();
+        assertThat(getFileRowIdFromDatabase(oldFile)).isEqualTo(-1);
+        assertThat(getFileRowIdFromDatabase(newFile)).isNotEqualTo(-1);
+    }
+
+    public static void assertCantRenameFile(File oldFile, File newFile) {
+        final int rowId = getFileRowIdFromDatabase(oldFile);
+        assertThat(oldFile.renameTo(newFile)).isFalse();
+        assertThat(oldFile.exists()).isTrue();
+        assertThat(getFileRowIdFromDatabase(oldFile)).isEqualTo(rowId);
+    }
+
+    public static void assertCanRenameDirectory(File oldDirectory, File newDirectory,
+            @Nullable File[] oldFilesList, @Nullable File[] newFilesList) {
+        assertThat(oldDirectory.renameTo(newDirectory)).isTrue();
+        assertThat(oldDirectory.exists()).isFalse();
+        assertThat(newDirectory.exists()).isTrue();
+        for (File file  : oldFilesList != null ? oldFilesList : new File[0]) {
+            assertThat(file.exists()).isFalse();
+            assertThat(getFileRowIdFromDatabase(file)).isEqualTo(-1);
+        }
+        for (File file : newFilesList != null ? newFilesList : new File[0]) {
+            assertThat(file.exists()).isTrue();
+            assertThat(getFileRowIdFromDatabase(file)).isNotEqualTo(-1);
+        };
+    }
+
+    public static void assertCantRenameDirectory(File oldDirectory, File newDirectory,
+            @Nullable File[] oldFilesList) {
+        assertThat(oldDirectory.renameTo(newDirectory)).isFalse();
+        assertThat(oldDirectory.exists()).isTrue();
+        for (File file  : oldFilesList != null ? oldFilesList : new File[0]) {
+            assertThat(file.exists()).isTrue();
+            assertThat(getFileRowIdFromDatabase(file)).isNotEqualTo(-1);
+        }
+    }
+
     public static void pollForExternalStorageState() throws Exception {
         for (int i = 0; i < POLLING_TIMEOUT_MILLIS / POLLING_SLEEP_MILLIS; i++) {
             if(Environment.getExternalStorageState(Environment.getExternalStorageDirectory())
@@ -424,6 +476,32 @@ public class TestUtils {
         }
         fail("Timed out while waiting for permission " + perm + " to be "
                 + (granted ? "granted" : "revoked"));
+    }
+
+    /**
+     * Asserts the entire content of the file equals exactly {@code expectedContent}.
+     */
+    public static void assertFileContent(File file, byte[] expectedContent) throws IOException {
+        try (final FileInputStream fis = new FileInputStream(file)) {
+            assertInputStreamContent(fis, expectedContent);
+        }
+    }
+
+    /**
+     * Asserts the entire content of the file equals exactly {@code expectedContent}.
+     * <p>Sets {@code fd} to beginning of file first.
+     */
+    public static void assertFileContent(FileDescriptor fd, byte[] expectedContent)
+            throws IOException, ErrnoException {
+        Os.lseek(fd, 0, OsConstants.SEEK_SET);
+        try (final FileInputStream fis = new FileInputStream(fd)) {
+            assertInputStreamContent(fis, expectedContent);
+        }
+    }
+
+    private static void assertInputStreamContent(InputStream in, byte[] expectedContent)
+            throws IOException {
+        assertThat(ByteStreams.toByteArray(in)).isEqualTo(expectedContent);
     }
 
     /**

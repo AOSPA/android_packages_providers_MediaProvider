@@ -51,6 +51,7 @@ import android.system.OsConstants;
 import android.util.ArrayMap;
 import android.util.ArraySet;
 import android.util.Log;
+import android.util.SparseArray;
 
 import androidx.annotation.GuardedBy;
 import androidx.annotation.NonNull;
@@ -60,6 +61,7 @@ import androidx.annotation.VisibleForTesting;
 import com.android.providers.media.util.BackgroundThread;
 import com.android.providers.media.util.DatabaseUtils;
 import com.android.providers.media.util.FileUtils;
+import com.android.providers.media.util.ForegroundThread;
 import com.android.providers.media.util.Logging;
 import com.android.providers.media.util.MimeUtils;
 
@@ -68,7 +70,7 @@ import java.io.FilenameFilter;
 import java.lang.annotation.Annotation;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
-import java.util.List;
+import java.util.Collection;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
@@ -101,6 +103,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
     final @Nullable Class<? extends Annotation> mColumnAnnotation;
     final @Nullable OnSchemaChangeListener mSchemaListener;
     final @Nullable OnFilesChangeListener mFilesListener;
+    final @Nullable OnLegacyMigrationListener mMigrationListener;
     final Set<String> mFilterVolumeNames = new ArraySet<>();
     long mScanStartTime;
     long mScanStopTime;
@@ -122,20 +125,27 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 int mediaType, boolean isDownload);
     }
 
+    public interface OnLegacyMigrationListener {
+        public void onStarted(ContentProviderClient client, String volumeName);
+        public void onFinished(ContentProviderClient client, String volumeName);
+    }
+
     public DatabaseHelper(Context context, String name,
             boolean internal, boolean earlyUpgrade, boolean legacyProvider,
             @Nullable Class<? extends Annotation> columnAnnotation,
             @Nullable OnSchemaChangeListener schemaListener,
-            @Nullable OnFilesChangeListener filesListener) {
+            @Nullable OnFilesChangeListener filesListener,
+            @Nullable OnLegacyMigrationListener migrationListener) {
         this(context, name, getDatabaseVersion(context), internal, earlyUpgrade, legacyProvider,
-                columnAnnotation, schemaListener, filesListener);
+                columnAnnotation, schemaListener, filesListener, migrationListener);
     }
 
     public DatabaseHelper(Context context, String name, int version,
             boolean internal, boolean earlyUpgrade, boolean legacyProvider,
             @Nullable Class<? extends Annotation> columnAnnotation,
             @Nullable OnSchemaChangeListener schemaListener,
-            @Nullable OnFilesChangeListener filesListener) {
+            @Nullable OnFilesChangeListener filesListener,
+            @Nullable OnLegacyMigrationListener migrationListener) {
         super(context, name, null, version);
         mContext = context;
         mName = name;
@@ -147,6 +157,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         mColumnAnnotation = columnAnnotation;
         mSchemaListener = schemaListener;
         mFilesListener = filesListener;
+        mMigrationListener = migrationListener;
 
         // Configure default filters until we hear differently
         if (mInternal) {
@@ -214,7 +225,13 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 final int mediaType = Integer.parseInt(split[2]);
                 final boolean isDownload = Integer.parseInt(split[3]) != 0;
 
-                mFilesListener.onInsert(DatabaseHelper.this, volumeName, id, mediaType, isDownload);
+                Trace.beginSection("_INSERT");
+                try {
+                    mFilesListener.onInsert(DatabaseHelper.this, volumeName, id,
+                            mediaType, isDownload);
+                } finally {
+                    Trace.endSection();
+                }
             }
             return null;
         });
@@ -228,8 +245,13 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 final int newMediaType = Integer.parseInt(split[4]);
                 final boolean newIsDownload = Integer.parseInt(split[5]) != 0;
 
-                mFilesListener.onUpdate(DatabaseHelper.this, volumeName, id,
-                        oldMediaType, oldIsDownload, newMediaType, newIsDownload);
+                Trace.beginSection("_UPDATE");
+                try {
+                    mFilesListener.onUpdate(DatabaseHelper.this, volumeName, id,
+                            oldMediaType, oldIsDownload, newMediaType, newIsDownload);
+                } finally {
+                    Trace.endSection();
+                }
             }
             return null;
         });
@@ -241,7 +263,13 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 final int mediaType = Integer.parseInt(split[2]);
                 final boolean isDownload = Integer.parseInt(split[3]) != 0;
 
-                mFilesListener.onDelete(DatabaseHelper.this, volumeName, id, mediaType, isDownload);
+                Trace.beginSection("_DELETE");
+                try {
+                    mFilesListener.onDelete(DatabaseHelper.this, volumeName, id,
+                            mediaType, isDownload);
+                } finally {
+                    Trace.endSection();
+                }
             }
             return null;
         });
@@ -331,11 +359,19 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         public boolean successful;
 
         /**
-         * List of {@link Uri} that would have been sent directly via
-         * {@link ContentResolver#notifyChange}, but are instead being collected
-         * due to this ongoing transaction.
+         * Map from {@code flags} value to set of {@link Uri} that would have
+         * been sent directly via {@link ContentResolver#notifyChange}, but are
+         * instead being collected due to this ongoing transaction.
          */
-        public final Set<Uri> notifyChanges = new ArraySet<>();
+        public final SparseArray<ArraySet<Uri>> notifyChanges = new SparseArray<>();
+
+        /**
+         * List of tasks that should be enqueued onto {@link BackgroundThread}
+         * after any {@link #notifyChanges} have been dispatched. We keep this
+         * as a separate pass to ensure that we don't risk running in parallel
+         * with other more important tasks.
+         */
+        public final ArrayList<Runnable> backgroundTasks = new ArrayList<>();
     }
 
     public void beginTransaction() {
@@ -371,8 +407,21 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         db.endTransaction();
 
         if (state.successful) {
-            BackgroundThread.getExecutor().execute(() -> {
-                notifyChangeInternal(state.notifyChanges);
+            // We carefully "phase" our two sets of work here to ensure that we
+            // completely finish dispatching all change notifications before we
+            // process background tasks, to ensure that the background work
+            // doesn't steal resources from the more important foreground work
+            ForegroundThread.getExecutor().execute(() -> {
+                for (int i = 0; i < state.notifyChanges.size(); i++) {
+                    notifyChangeInternal(state.notifyChanges.valueAt(i),
+                            state.notifyChanges.keyAt(i));
+                }
+
+                // Now that we've finished with all our important work, we can
+                // finally kick off any internal background tasks
+                for (int i = 0; i < state.backgroundTasks.size(); i++) {
+                    BackgroundThread.getExecutor().execute(state.backgroundTasks.get(i));
+                }
             });
         }
     }
@@ -399,38 +448,69 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         }
     }
 
+    public void notifyInsert(@NonNull Uri uri) {
+        notifyChange(uri, ContentResolver.NOTIFY_INSERT);
+    }
+
+    public void notifyUpdate(@NonNull Uri uri) {
+        notifyChange(uri, ContentResolver.NOTIFY_UPDATE);
+    }
+
+    public void notifyDelete(@NonNull Uri uri) {
+        notifyChange(uri, ContentResolver.NOTIFY_DELETE);
+    }
+
     /**
      * Notify that the given {@link Uri} has changed. This enqueues the
      * notification if currently inside a transaction, and they'll be
      * clustered and sent when the transaction completes.
      */
-    public void notifyChange(@NonNull Uri uri) {
+    public void notifyChange(@NonNull Uri uri, int flags) {
         if (LOGV) Log.v(TAG, "Notifying " + uri);
         final TransactionState state = mTransactionState.get();
         if (state != null) {
-            state.notifyChanges.add(uri);
+            ArraySet<Uri> set = state.notifyChanges.get(flags);
+            if (set == null) {
+                set = new ArraySet<>();
+                state.notifyChanges.put(flags, set);
+            }
+            set.add(uri);
         } else {
-            BackgroundThread.getExecutor().execute(() -> {
-                notifySingleChangeInternal(uri);
+            ForegroundThread.getExecutor().execute(() -> {
+                notifySingleChangeInternal(uri, flags);
             });
         }
     }
 
-    private void notifySingleChangeInternal(Uri uri) {
+    private void notifySingleChangeInternal(@NonNull Uri uri, int flags) {
         Trace.beginSection("notifySingleChange");
         try {
-            mContext.getContentResolver().notifyChange(uri, null, 0);
+            mContext.getContentResolver().notifyChange(uri, null, flags);
         } finally {
             Trace.endSection();
         }
     }
 
-    private void notifyChangeInternal(Iterable<Uri> uris) {
+    private void notifyChangeInternal(@NonNull Collection<Uri> uris, int flags) {
         Trace.beginSection("notifyChange");
         try {
-            mContext.getContentResolver().notifyChange(uris, null, 0);
+            mContext.getContentResolver().notifyChange(uris, null, flags);
         } finally {
             Trace.endSection();
+        }
+    }
+
+    /**
+     * Post given task to be run in background. This enqueues the task if
+     * currently inside a transaction, and they'll be clustered and sent when
+     * the transaction completes.
+     */
+    public void postBackground(@NonNull Runnable command) {
+        final TransactionState state = mTransactionState.get();
+        if (state != null) {
+            state.backgroundTasks.add(command);
+        } else {
+            BackgroundThread.getExecutor().execute(command);
         }
     }
 
@@ -617,6 +697,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
 
             db.execSQL("SAVEPOINT before_migrate");
             Log.d(TAG, "Starting migration from legacy provider for " + mName);
+            mMigrationListener.onStarted(client, mVolumeName);
             try (Cursor c = client.query(queryUri, sMigrateColumns.toArray(new String[0]),
                     extras, null)) {
                 final ContentValues values = new ContentValues();
@@ -635,11 +716,13 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
 
                 db.execSQL("RELEASE before_migrate");
                 Log.d(TAG, "Finished migration from legacy provider for " + mName);
+                mMigrationListener.onFinished(client, mVolumeName);
             } catch (Exception e) {
                 // We have to guard ourselves against any weird behavior of the
                 // legacy provider by trying to catch everything
                 db.execSQL("ROLLBACK TO before_migrate");
                 Log.w(TAG, "Failed migration from legacy provider: " + e);
+                mMigrationListener.onFinished(client, mVolumeName);
             }
         }
     }
@@ -700,9 +783,9 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         }
 
         if (!internal) {
-            db.execSQL("CREATE VIEW audio_playlists AS SELECT _id,_data,name,date_added,"
-                    + "date_modified,owner_package_name,_hash,is_pending,date_expires,is_trashed,"
-                    + "volume_name FROM files WHERE media_type=4");
+            db.execSQL("CREATE VIEW audio_playlists AS SELECT "
+                    + String.join(",", getProjectionMap(Audio.Playlists.class).keySet())
+                    + " FROM files WHERE media_type=4");
         }
 
         db.execSQL("CREATE VIEW searchhelpertitle AS SELECT * FROM audio ORDER BY title_key");
