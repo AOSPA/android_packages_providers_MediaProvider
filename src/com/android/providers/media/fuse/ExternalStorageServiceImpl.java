@@ -77,7 +77,6 @@ public final class ExternalStorageServiceImpl extends ExternalStorageService {
         switch(vol.getState()) {
             case Environment.MEDIA_MOUNTED:
                 mediaProvider.attachVolume(volumeName);
-                MediaService.onScanVolume(this, volumeName, REASON_MOUNTED);
                 break;
             case Environment.MEDIA_UNMOUNTED:
             case Environment.MEDIA_EJECTING:
@@ -89,6 +88,8 @@ public final class ExternalStorageServiceImpl extends ExternalStorageService {
                 Log.i(TAG, "Ignoring volume state for vol:" + volumeName
                         + ". State: " + vol.getState());
         }
+        // Check for invalidation of cached volumes
+        mediaProvider.updateVolumes();
     }
 
     @Override
