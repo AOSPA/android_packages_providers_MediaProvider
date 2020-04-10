@@ -20,6 +20,7 @@ import static com.android.providers.media.scan.MediaScanner.REASON_UNKNOWN;
 import static com.android.providers.media.scan.MediaScannerTest.stage;
 import static com.android.providers.media.scan.ModernMediaScanner.isDirectoryHidden;
 import static com.android.providers.media.scan.ModernMediaScanner.isFileAlbumArt;
+import static com.android.providers.media.scan.ModernMediaScanner.isFileHidden;
 import static com.android.providers.media.scan.ModernMediaScanner.parseOptionalDateTaken;
 import static com.android.providers.media.scan.ModernMediaScanner.parseOptionalMimeType;
 import static com.android.providers.media.scan.ModernMediaScanner.parseOptionalYear;
@@ -289,6 +290,18 @@ public class ModernMediaScannerTest {
     }
 
     @Test
+    public void testIsFileHidden() throws Exception {
+        assertFalse(isFileHidden(
+                new File("/storage/emulated/0/DCIM/IMG1024.JPG")));
+        assertFalse(isFileHidden(
+                new File("/storage/emulated/0/DCIM/.pending-1577836800-IMG1024.JPG")));
+        assertFalse(isFileHidden(
+                new File("/storage/emulated/0/DCIM/.trashed-1577836800-IMG1024.JPG")));
+        assertTrue(isFileHidden(
+                new File("/storage/emulated/0/DCIM/.IMG1024.JPG")));
+    }
+
+    @Test
     public void testIsZero() throws Exception {
         assertFalse(ModernMediaScanner.isZero(""));
         assertFalse(ModernMediaScanner.isZero("meow"));
@@ -375,6 +388,28 @@ public class ModernMediaScannerTest {
             cursor.moveToNext();
             assertEquals("003.mp3", cursor.getString(0));
         }
+
+        // Replace media file in a completely different location, which normally
+        // wouldn't match the exact playlist path, but we're willing to perform
+        // a relaxed search
+        final File soundtracks = new File(mDir, "Soundtracks");
+        soundtracks.mkdirs();
+        stage(R.raw.test_audio, new File(soundtracks, "002.mp3"));
+        stage(res, new File(music, name));
+
+        mModern.scanDirectory(mDir, REASON_UNKNOWN);
+
+        try (Cursor cursor = mIsolatedResolver.query(membersUri, new String[] {
+                MediaColumns.DISPLAY_NAME
+        }, null, null, MediaStore.Audio.Playlists.Members.PLAY_ORDER + " ASC")) {
+            assertEquals(5, cursor.getCount());
+            cursor.moveToNext();
+            assertEquals("001.mp3", cursor.getString(0));
+            cursor.moveToNext();
+            assertEquals("002.mp3", cursor.getString(0));
+            cursor.moveToNext();
+            assertEquals("003.mp3", cursor.getString(0));
+        }
     }
 
     @Test
@@ -449,6 +484,24 @@ public class ModernMediaScannerTest {
         file.delete();
         mModern.scanDirectory(mDir, REASON_UNKNOWN);
         assertQueryCount(0, MediaStore.Images.Media.EXTERNAL_CONTENT_URI);
+    }
+
+    /**
+     * All file formats are thoroughly tested by {@code CtsProviderTestCases},
+     * but to prove code coverage we also need to exercise manually here with a
+     * bare-bones scan operation.
+     */
+    @Test
+    public void testScan_Coverage() throws Exception {
+        stage(R.raw.test_audio, new File(mDir, "audio.mp3"));
+        stage(R.raw.test_video, new File(mDir, "video.mp4"));
+        stage(R.raw.test_image, new File(mDir, "image.jpg"));
+        stage(R.raw.test_m3u, new File(mDir, "playlist.m3u"));
+        stage(R.raw.test_srt, new File(mDir, "subtitle.srt"));
+        stage(R.raw.test_txt, new File(mDir, "document.txt"));
+        stage(R.raw.test_bin, new File(mDir, "random.bin"));
+
+        mModern.scanDirectory(mDir, REASON_UNKNOWN);
     }
 
     @Test
@@ -587,8 +640,7 @@ public class ModernMediaScannerTest {
                 "/storage/emulated/0/albumart1.jpg",
         }) {
             final File file = new File(path);
-            final String name = file.getName();
-            assertEquals(LegacyMediaScannerTest.isNonMediaFile(path), isFileAlbumArt(name));
+            assertEquals(LegacyMediaScannerTest.isNonMediaFile(path), isFileAlbumArt(file));
         }
 
         for (String path : new String[] {
@@ -596,8 +648,7 @@ public class ModernMediaScannerTest {
                 "/storage/emulated/0/albumartlarge.jpg",
         }) {
             final File file = new File(path);
-            final String name = file.getName();
-            assertTrue(isFileAlbumArt(name));
+            assertTrue(isFileAlbumArt(file));
         }
     }
 }

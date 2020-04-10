@@ -38,6 +38,7 @@ import static android.media.MediaMetadataRetriever.METADATA_KEY_MIMETYPE;
 import static android.media.MediaMetadataRetriever.METADATA_KEY_NUM_TRACKS;
 import static android.media.MediaMetadataRetriever.METADATA_KEY_TITLE;
 import static android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT;
+import static android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION;
 import static android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH;
 import static android.media.MediaMetadataRetriever.METADATA_KEY_WRITER;
 import static android.media.MediaMetadataRetriever.METADATA_KEY_YEAR;
@@ -684,8 +685,7 @@ public class ModernMediaScanner implements MediaScanner {
      */
     private static @Nullable ContentProviderOperation.Builder scanItem(long existingId, File file,
             BasicFileAttributes attrs, String mimeType, String volumeName) {
-        final String name = file.getName();
-        if (name.startsWith(".")) {
+        if (isFileHidden(file)) {
             if (LOGD) Log.d(TAG, "Ignoring hidden file: " + file);
             return null;
         }
@@ -695,7 +695,7 @@ public class ModernMediaScanner implements MediaScanner {
         }
 
         int mediaType = MimeUtils.resolveMediaType(mimeType);
-        if (mediaType == FileColumns.MEDIA_TYPE_IMAGE && isFileAlbumArt(name)) {
+        if (mediaType == FileColumns.MEDIA_TYPE_IMAGE && isFileAlbumArt(file)) {
             mediaType = FileColumns.MEDIA_TYPE_NONE;
         }
         switch (mediaType) {
@@ -956,6 +956,8 @@ public class ModernMediaScanner implements MediaScanner {
                         parseOptional(mmr.extractMetadata(METADATA_KEY_VIDEO_HEIGHT)));
                 withOptionalValue(op, MediaColumns.RESOLUTION,
                         parseOptionalVideoResolution(mmr));
+                withOptionalValue(op, MediaColumns.ORIENTATION,
+                        parseOptional(mmr.extractMetadata(METADATA_KEY_VIDEO_ROTATION)));
 
                 withOptionalValue(op, VideoColumns.COLOR_STANDARD,
                         parseOptional(mmr.extractMetadata(METADATA_KEY_COLOR_STANDARD)));
@@ -1260,7 +1262,7 @@ public class ModernMediaScanner implements MediaScanner {
     /**
      * Test if any parents of given directory should be considered hidden.
      */
-    static boolean isDirectoryHiddenRecursive(File dir) {
+    static boolean isDirectoryHiddenRecursive(@NonNull File dir) {
         Trace.beginSection("isDirectoryHiddenRecursive");
         try {
             while (dir != null) {
@@ -1278,7 +1280,8 @@ public class ModernMediaScanner implements MediaScanner {
     /**
      * Test if this given directory should be considered hidden.
      */
-    static boolean isDirectoryHidden(File dir) {
+    @VisibleForTesting
+    static boolean isDirectoryHidden(@NonNull File dir) {
         final File nomedia = new File(dir, ".nomedia");
 
         // Handle well-known paths that should always be visible or invisible,
@@ -1307,16 +1310,36 @@ public class ModernMediaScanner implements MediaScanner {
         return false;
     }
 
+    /**
+     * Test if this given file should be considered hidden.
+     */
     @VisibleForTesting
-    static boolean isFileAlbumArt(String name) {
-        return PATTERN_ALBUM_ART.matcher(name).matches();
+    static boolean isFileHidden(@NonNull File file) {
+        final String name = file.getName();
+
+        // Handle well-known file names that are pending or trashed; they
+        // normally appear hidden, but we give them special treatment
+        if (FileUtils.PATTERN_EXPIRES_FILE.matcher(name).matches()) {
+            return false;
+        }
+
+        // Otherwise fall back to file name
+        if (name.startsWith(".")) {
+            return true;
+        }
+        return false;
+    }
+
+    @VisibleForTesting
+    static boolean isFileAlbumArt(@NonNull File file) {
+        return PATTERN_ALBUM_ART.matcher(file.getName()).matches();
     }
 
     /**
      * Test if this given {@link Uri} is a
      * {@link android.provider.MediaStore.Audio.Playlists} item.
      */
-    static boolean isPlaylist(Uri uri) {
+    static boolean isPlaylist(@NonNull Uri uri) {
         final List<String> path = uri.getPathSegments();
         return (path.size() == 4) && path.get(1).equals("audio") && path.get(2).equals("playlists");
     }
@@ -1333,7 +1356,7 @@ public class ModernMediaScanner implements MediaScanner {
         return true;
     }
 
-    static void logTroubleScanning(File file, Exception e) {
+    static void logTroubleScanning(@NonNull File file, @NonNull Exception e) {
         if (LOGW) Log.w(TAG, "Trouble scanning " + file + ": " + e);
     }
 }

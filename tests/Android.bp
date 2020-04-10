@@ -17,6 +17,7 @@ android_test {
         "res",
     ],
     srcs: [
+        ":framework-mediaprovider-sources",
         ":mediaprovider-sources",
         "src/**/*.java",
     ],
@@ -28,16 +29,13 @@ android_test {
         "unsupportedappusage",
     ],
 
-    jni_libs: [
-        "libfuse_jni",
-    ],
-
     static_libs: [
         "androidx.appcompat_appcompat",
         "androidx.core_core",
         "androidx.test.rules",
         "guava",
         "mockito-target",
+        "truth-prebuilt",
     ],
 
     certificate: "media",

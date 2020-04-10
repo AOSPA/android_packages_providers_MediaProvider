@@ -74,7 +74,7 @@ public class DatabaseHelperTest {
     @Test
     public void testFilterVolumeNames() throws Exception {
         try (DatabaseHelper helper = new DatabaseHelperR(getContext(), TEST_CLEAN_DB)) {
-            SQLiteDatabase db = helper.getWritableDatabase();
+            SQLiteDatabase db = helper.getWritableDatabaseForTest();
             {
                 final ContentValues values = new ContentValues();
                 values.put(FileColumns.MEDIA_TYPE, FileColumns.MEDIA_TYPE_AUDIO);
@@ -163,7 +163,7 @@ public class DatabaseHelperTest {
                 helper.endTransaction();
             }
 
-            helper.runWithTransaction(() -> {
+            helper.runWithTransaction((db) -> {
                 return 0;
             });
         }
@@ -188,7 +188,7 @@ public class DatabaseHelperTest {
             Class<? extends DatabaseHelper> after) throws Exception {
         try (DatabaseHelper helper = before.getConstructor(Context.class, String.class)
                 .newInstance(getContext(), TEST_DOWNGRADE_DB)) {
-            SQLiteDatabase db = helper.getWritableDatabase();
+            SQLiteDatabase db = helper.getWritableDatabaseForTest();
             {
                 final ContentValues values = new ContentValues();
                 values.put(FileColumns.DATA,
@@ -207,7 +207,7 @@ public class DatabaseHelperTest {
         // Downgrade will wipe data, but at least we don't crash
         try (DatabaseHelper helper = after.getConstructor(Context.class, String.class)
                 .newInstance(getContext(), TEST_DOWNGRADE_DB)) {
-            SQLiteDatabase db = helper.getWritableDatabase();
+            SQLiteDatabase db = helper.getWritableDatabaseForTest();
             try (Cursor c = db.query("files", null, null, null, null, null, null, null)) {
                 assertEquals(0, c.getCount());
             }
@@ -235,7 +235,7 @@ public class DatabaseHelperTest {
             Class<? extends DatabaseHelper> after) throws Exception {
         try (DatabaseHelper helper = before.getConstructor(Context.class, String.class)
                 .newInstance(getContext(), TEST_RECOMPUTE_DB)) {
-            SQLiteDatabase db = helper.getWritableDatabase();
+            SQLiteDatabase db = helper.getWritableDatabaseForTest();
             {
                 final ContentValues values = new ContentValues();
                 values.put(FileColumns.DATA,
@@ -299,7 +299,7 @@ public class DatabaseHelperTest {
 
         try (DatabaseHelper helper = after.getConstructor(Context.class, String.class)
                 .newInstance(getContext(), TEST_RECOMPUTE_DB)) {
-            SQLiteDatabase db = helper.getWritableDatabase();
+            SQLiteDatabase db = helper.getWritableDatabaseForTest();
             try (Cursor c = db.query("files", null, FileColumns.DISPLAY_NAME + "='global.jpg'",
                     null, null, null, null)) {
                 assertEquals(1, c.getCount());
@@ -369,18 +369,18 @@ public class DatabaseHelperTest {
             Class<? extends DatabaseHelper> after) throws Exception {
         try (DatabaseHelper helper = before.getConstructor(Context.class, String.class)
                 .newInstance(getContext(), TEST_UPGRADE_DB)) {
-            SQLiteDatabase db = helper.getWritableDatabase();
+            SQLiteDatabase db = helper.getWritableDatabaseForTest();
         }
 
         try (DatabaseHelper helper = after.getConstructor(Context.class, String.class)
                 .newInstance(getContext(), TEST_UPGRADE_DB)) {
-            SQLiteDatabase db = helper.getWritableDatabase();
+            SQLiteDatabase db = helper.getWritableDatabaseForTest();
 
             // Create a second isolated instance from scratch and assert that
             // upgraded schema is identical
             try (DatabaseHelper helper2 = after.getConstructor(Context.class, String.class)
                     .newInstance(getContext(), TEST_CLEAN_DB)) {
-                SQLiteDatabase db2 = helper2.getWritableDatabase();
+                SQLiteDatabase db2 = helper2.getWritableDatabaseForTest();
 
                 try (Cursor c1 = db.query("sqlite_master",
                         null, null, null, null, null, SQLITE_MASTER_ORDER_BY);
@@ -413,8 +413,8 @@ public class DatabaseHelperTest {
 
     private static Set<String> queryValues(@NonNull DatabaseHelper helper, @NonNull String table,
             @NonNull String columnName) {
-        try (Cursor c = helper.getReadableDatabase().query(table, new String[] { columnName },
-                null, null, null, null, null)) {
+        try (Cursor c = helper.getWritableDatabaseForTest().query(table,
+                new String[] { columnName }, null, null, null, null, null)) {
             final ArraySet<String> res = new ArraySet<>();
             while (c.moveToNext()) {
                 res.add(c.getString(0));
@@ -426,58 +426,43 @@ public class DatabaseHelperTest {
     private static class DatabaseHelperO extends DatabaseHelper {
         public DatabaseHelperO(Context context, String name) {
             super(context, name, DatabaseHelper.VERSION_O,
-                    false, false, true, Column.class, null, null, null);
+                    false, false, true, Column.class, null, null, null, null);
         }
 
         @Override
         public void onCreate(SQLiteDatabase db) {
             createOSchema(db, false);
         }
-
-        @Override
-        public void onOpen(SQLiteDatabase db) {
-            // Purposefully empty to leave views intact
-        }
     }
 
     private static class DatabaseHelperP extends DatabaseHelper {
         public DatabaseHelperP(Context context, String name) {
             super(context, name, DatabaseHelper.VERSION_P,
-                    false, false, true, Column.class, null, null, null);
+                    false, false, true, Column.class, null, null, null, null);
         }
 
         @Override
         public void onCreate(SQLiteDatabase db) {
             createPSchema(db, false);
         }
-
-        @Override
-        public void onOpen(SQLiteDatabase db) {
-            // Purposefully empty to leave views intact
-        }
     }
 
     private static class DatabaseHelperQ extends DatabaseHelper {
         public DatabaseHelperQ(Context context, String name) {
             super(context, name, DatabaseHelper.VERSION_Q,
-                    false, false, true, Column.class, null, null, null);
+                    false, false, true, Column.class, null, null, null, null);
         }
 
         @Override
         public void onCreate(SQLiteDatabase db) {
             createQSchema(db, false);
         }
-
-        @Override
-        public void onOpen(SQLiteDatabase db) {
-            // Purposefully empty to leave views intact
-        }
     }
 
     private static class DatabaseHelperR extends DatabaseHelper {
         public DatabaseHelperR(Context context, String name) {
             super(context, name, DatabaseHelper.VERSION_R,
-                    false, false, true, Column.class, null, null, null);
+                    false, false, true, Column.class, null, null, null, null);
         }
     }
 

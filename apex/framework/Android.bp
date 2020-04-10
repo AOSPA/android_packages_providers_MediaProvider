@@ -25,18 +25,16 @@ java_library {
 
     installable: true,
 
-    sdk_version: "core_current",
+    sdk_version: "module_current",
     libs: [
-        // The order matters. android_system_* library should come later.
         "framework_mediaprovider_annotation",
-        "android_system_stubs_current",
         "unsupportedappusage",
     ],
 
     plugins: ["java_api_finder"],
 
     hostdex: true, // for hiddenapi check
-    visibility: ["//packages/providers/MediaProvider/apex:__subpackages__"],
+    visibility: ["//packages/providers/MediaProvider:__subpackages__"],
     apex_available: [
         "com.android.mediaprovider",
         "test_com.android.mediaprovider",
