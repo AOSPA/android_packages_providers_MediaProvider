@@ -38,6 +38,7 @@ import static android.media.MediaMetadataRetriever.METADATA_KEY_MIMETYPE;
 import static android.media.MediaMetadataRetriever.METADATA_KEY_NUM_TRACKS;
 import static android.media.MediaMetadataRetriever.METADATA_KEY_TITLE;
 import static android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT;
+import static android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION;
 import static android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH;
 import static android.media.MediaMetadataRetriever.METADATA_KEY_WRITER;
 import static android.media.MediaMetadataRetriever.METADATA_KEY_YEAR;
@@ -109,7 +110,6 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
-import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
@@ -224,6 +224,7 @@ public class ModernMediaScanner implements MediaScanner {
         } catch (OperationCanceledException ignored) {
         }
     }
+
     @Override
     public Uri scanFile(File file, int reason) {
        return scanFile(file, reason, /*ownerPackage*/ null);
@@ -233,7 +234,7 @@ public class ModernMediaScanner implements MediaScanner {
     public Uri scanFile(File file, int reason, @Nullable String ownerPackage) {
         try (Scan scan = new Scan(file, reason, ownerPackage)) {
             scan.run();
-            return scan.mFirstResult;
+            return scan.getFirstResult();
         } catch (OperationCanceledException ignored) {
             return null;
         }
@@ -282,18 +283,15 @@ public class ModernMediaScanner implements MediaScanner {
         private final ArrayList<ContentProviderOperation> mPending = new ArrayList<>();
         private LongArray mScannedIds = new LongArray();
         private LongArray mUnknownIds = new LongArray();
-        private LongArray mPlaylistIds = new LongArray();
 
-        private Uri mFirstResult;
+        private long mFirstId = -1;
 
         private int mFileCount;
         private int mInsertCount;
         private int mUpdateCount;
         private int mDeleteCount;
 
-
         public Scan(File root, int reason, @Nullable String ownerPackage) {
-
             Trace.beginSection("ctor");
 
             mClient = mContext.getContentResolver()
@@ -331,9 +329,7 @@ public class ModernMediaScanner implements MediaScanner {
             }
 
             // Third, resolve any playlists that we scanned
-            if (mPlaylistIds.size() > 0) {
-                resolvePlaylists();
-            }
+            resolvePlaylists();
 
             if (!mSingleFile) {
                 final long durationMillis = SystemClock.elapsedRealtime() - startTime;
@@ -384,7 +380,8 @@ public class ModernMediaScanner implements MediaScanner {
             final Bundle queryArgs = new Bundle();
             queryArgs.putString(ContentResolver.QUERY_ARG_SQL_SELECTION,
                     formatClause + " AND " + dataClause + " AND " + generationClause);
-            final String pathEscapedForLike = DatabaseUtils.escapeForLike(mRoot.getAbsolutePath());
+            final String pathEscapedForLike = DatabaseUtils.escapeForLike(
+                    FileUtils.getAbsoluteSanitizedPath(mRoot.getAbsolutePath()));
             queryArgs.putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS,
                     new String[] {pathEscapedForLike + "/%", pathEscapedForLike});
             queryArgs.putString(ContentResolver.QUERY_ARG_SQL_SORT_ORDER,
@@ -426,15 +423,23 @@ public class ModernMediaScanner implements MediaScanner {
 
         private void resolvePlaylists() {
             mSignal.throwIfCanceled();
-            for (int i = 0; i < mPlaylistIds.size(); i++) {
-                final Uri uri = MediaStore.Files.getContentUri(mVolumeName, mPlaylistIds.get(i));
-                try {
-                    PlaylistResolver.resolvePlaylist(mResolver, uri).forEach(this::addPending);
-                    maybeApplyPending();
-                } catch (IOException e) {
-                    if (LOGW) Log.w(TAG, "Ignoring troubled playlist: " + uri, e);
+
+            // Playlists aren't supported on internal storage, so bail early
+            if (MediaStore.VOLUME_INTERNAL.equals(mVolumeName)) return;
+
+            final Uri playlistsUri = MediaStore.Audio.Playlists.getContentUri(mVolumeName);
+            final Bundle queryArgs = new Bundle();
+            queryArgs.putString(ContentResolver.QUERY_ARG_SQL_SELECTION,
+                    FileColumns.GENERATION_MODIFIED + " > " + mStartGeneration);
+            try (Cursor c = mResolver.query(playlistsUri, new String[] { FileColumns._ID },
+                    queryArgs, mSignal)) {
+                while (c.moveToNext()) {
+                    final long id = c.getLong(0);
+                    MediaStore.resolvePlaylistMembers(mResolver,
+                            ContentUris.withAppendedId(playlistsUri, id));
                 }
-                applyPending();
+            } finally {
+                Trace.endSection();
             }
         }
 
@@ -552,8 +557,8 @@ public class ModernMediaScanner implements MediaScanner {
                     mScannedIds.add(existingId);
 
                     // We also technically found our first result
-                    if (mFirstResult == null) {
-                        mFirstResult = MediaStore.Files.getContentUri(mVolumeName, existingId);
+                    if (mFirstId == -1) {
+                        mFirstId = existingId;
                     }
 
                     final boolean sameTime = (lastModifiedTime(realFile, attrs) == dateModified);
@@ -651,34 +656,56 @@ public class ModernMediaScanner implements MediaScanner {
                     ContentProviderOperation operation = mPending.get(index);
 
                     if (result.exception != null) {
-                        Log.w(TAG, "Failed to apply " + operation + ": " + result.exception);
+                        Log.w(TAG, "Failed to apply " + operation, result.exception);
                     }
 
                     Uri uri = result.uri;
                     if (uri != null) {
-                        if (mFirstResult == null) {
-                            mFirstResult = uri;
-                        }
                         final long id = ContentUris.parseId(uri);
-                        mScannedIds.add(id);
-                    }
-
-                    // Some operations don't return a URI, so check the original if necessary
-                    Uri uriToCheck = uri == null ? operation.getUri() : uri;
-                    if (uriToCheck != null) {
-                        if (isPlaylist(uriToCheck)) {
-                            // If this was a playlist, remember it so we can resolve
-                            // its contents once all other media has been scanned
-                            mPlaylistIds.add(ContentUris.parseId(uriToCheck));
+                        if (mFirstId == -1) {
+                            mFirstId = id;
                         }
+                        mScannedIds.add(id);
                     }
                 }
             } catch (RemoteException | OperationApplicationException e) {
-                Log.w(TAG, "Failed to apply: " + e);
+                Log.w(TAG, "Failed to apply", e);
             } finally {
                 mPending.clear();
                 Trace.endSection();
             }
+        }
+
+        /**
+         * Return the first item encountered by this scan requested.
+         * <p>
+         * Internally resolves to the relevant media collection where this item
+         * exists based on {@link FileColumns#MEDIA_TYPE}.
+         */
+        public @Nullable Uri getFirstResult() {
+            if (mFirstId == -1) return null;
+
+            final Uri fileUri = MediaStore.Files.getContentUri(mVolumeName, mFirstId);
+            try (Cursor c = mResolver.query(fileUri,
+                    new String[] { FileColumns.MEDIA_TYPE }, null, null)) {
+                if (c.moveToFirst()) {
+                    switch (c.getInt(0)) {
+                        case FileColumns.MEDIA_TYPE_AUDIO:
+                            return MediaStore.Audio.Media.getContentUri(mVolumeName, mFirstId);
+                        case FileColumns.MEDIA_TYPE_VIDEO:
+                            return MediaStore.Video.Media.getContentUri(mVolumeName, mFirstId);
+                        case FileColumns.MEDIA_TYPE_IMAGE:
+                            return MediaStore.Images.Media.getContentUri(mVolumeName, mFirstId);
+                        case FileColumns.MEDIA_TYPE_PLAYLIST:
+                            return ContentUris.withAppendedId(
+                                    MediaStore.Audio.Playlists.getContentUri(mVolumeName),
+                                    mFirstId);
+                    }
+                }
+            }
+
+            // Worst case, we can always use generic collection
+            return fileUri;
         }
     }
 
@@ -689,8 +716,7 @@ public class ModernMediaScanner implements MediaScanner {
      */
     private static @Nullable ContentProviderOperation.Builder scanItem(long existingId, File file,
             BasicFileAttributes attrs, String mimeType, String volumeName) {
-        final String name = file.getName();
-        if (name.startsWith(".")) {
+        if (isFileHidden(file)) {
             if (LOGD) Log.d(TAG, "Ignoring hidden file: " + file);
             return null;
         }
@@ -700,7 +726,7 @@ public class ModernMediaScanner implements MediaScanner {
         }
 
         int mediaType = MimeUtils.resolveMediaType(mimeType);
-        if (mediaType == FileColumns.MEDIA_TYPE_IMAGE && isFileAlbumArt(name)) {
+        if (mediaType == FileColumns.MEDIA_TYPE_IMAGE && isFileAlbumArt(file)) {
             mediaType = FileColumns.MEDIA_TYPE_NONE;
         }
         switch (mediaType) {
@@ -732,6 +758,8 @@ public class ModernMediaScanner implements MediaScanner {
      */
     private static void withGenericValues(ContentProviderOperation.Builder op,
             File file, BasicFileAttributes attrs, String mimeType) {
+        op.withValue(FileColumns.MEDIA_TYPE, MimeUtils.resolveMediaType(mimeType));
+
         op.withValue(MediaColumns.DATA, file.getAbsolutePath());
         op.withValue(MediaColumns.SIZE, attrs.size());
         op.withValue(MediaColumns.DATE_MODIFIED, lastModifiedTime(file, attrs));
@@ -792,7 +820,7 @@ public class ModernMediaScanner implements MediaScanner {
         withOptionalValue(op, MediaColumns.TITLE,
                 parseOptional(mmr.extractMetadata(METADATA_KEY_TITLE)));
         withOptionalValue(op, MediaColumns.YEAR,
-                parseOptionalOrZero(mmr.extractMetadata(METADATA_KEY_YEAR)));
+                parseOptionalYear(mmr.extractMetadata(METADATA_KEY_YEAR)));
         withOptionalValue(op, MediaColumns.DURATION,
                 parseOptional(mmr.extractMetadata(METADATA_KEY_DURATION)));
         withOptionalValue(op, MediaColumns.NUM_TRACKS,
@@ -838,8 +866,7 @@ public class ModernMediaScanner implements MediaScanner {
 
     private static @NonNull ContentProviderOperation.Builder scanItemDirectory(long existingId,
             File file, BasicFileAttributes attrs, String mimeType, String volumeName) {
-        final ContentProviderOperation.Builder op = newUpsert(
-                MediaStore.Files.getContentUri(volumeName), existingId);
+        final ContentProviderOperation.Builder op = newUpsert(volumeName, existingId);
         withGenericValues(op, file, attrs, mimeType);
 
         try {
@@ -865,8 +892,7 @@ public class ModernMediaScanner implements MediaScanner {
 
     private static @NonNull ContentProviderOperation.Builder scanItemAudio(long existingId,
             File file, BasicFileAttributes attrs, String mimeType, String volumeName) {
-        final ContentProviderOperation.Builder op = newUpsert(
-                MediaStore.Audio.Media.getContentUri(volumeName), existingId);
+        final ContentProviderOperation.Builder op = newUpsert(volumeName, existingId);
         withGenericValues(op, file, attrs, mimeType);
 
         op.withValue(MediaColumns.ARTIST, UNKNOWN_STRING);
@@ -907,8 +933,7 @@ public class ModernMediaScanner implements MediaScanner {
 
     private static @NonNull ContentProviderOperation.Builder scanItemPlaylist(long existingId,
             File file, BasicFileAttributes attrs, String mimeType, String volumeName) {
-        final ContentProviderOperation.Builder op = newUpsert(
-                MediaStore.Audio.Playlists.getContentUri(volumeName), existingId);
+        final ContentProviderOperation.Builder op = newUpsert(volumeName, existingId);
         withGenericValues(op, file, attrs, mimeType);
 
         try {
@@ -921,8 +946,7 @@ public class ModernMediaScanner implements MediaScanner {
 
     private static @NonNull ContentProviderOperation.Builder scanItemSubtitle(long existingId,
             File file, BasicFileAttributes attrs, String mimeType, String volumeName) {
-        final ContentProviderOperation.Builder op = newUpsert(
-                MediaStore.Files.getContentUri(volumeName), existingId);
+        final ContentProviderOperation.Builder op = newUpsert(volumeName, existingId);
         withGenericValues(op, file, attrs, mimeType);
 
         return op;
@@ -930,8 +954,7 @@ public class ModernMediaScanner implements MediaScanner {
 
     private static @NonNull ContentProviderOperation.Builder scanItemDocument(long existingId,
             File file, BasicFileAttributes attrs, String mimeType, String volumeName) {
-        final ContentProviderOperation.Builder op = newUpsert(
-                MediaStore.Files.getContentUri(volumeName), existingId);
+        final ContentProviderOperation.Builder op = newUpsert(volumeName, existingId);
         withGenericValues(op, file, attrs, mimeType);
 
         return op;
@@ -939,8 +962,7 @@ public class ModernMediaScanner implements MediaScanner {
 
     private static @NonNull ContentProviderOperation.Builder scanItemVideo(long existingId,
             File file, BasicFileAttributes attrs, String mimeType, String volumeName) {
-        final ContentProviderOperation.Builder op = newUpsert(
-                MediaStore.Video.Media.getContentUri(volumeName), existingId);
+        final ContentProviderOperation.Builder op = newUpsert(volumeName, existingId);
         withGenericValues(op, file, attrs, mimeType);
 
         op.withValue(MediaColumns.ARTIST, UNKNOWN_STRING);
@@ -961,6 +983,8 @@ public class ModernMediaScanner implements MediaScanner {
                         parseOptional(mmr.extractMetadata(METADATA_KEY_VIDEO_HEIGHT)));
                 withOptionalValue(op, MediaColumns.RESOLUTION,
                         parseOptionalVideoResolution(mmr));
+                withOptionalValue(op, MediaColumns.ORIENTATION,
+                        parseOptional(mmr.extractMetadata(METADATA_KEY_VIDEO_ROTATION)));
 
                 withOptionalValue(op, VideoColumns.COLOR_STANDARD,
                         parseOptional(mmr.extractMetadata(METADATA_KEY_COLOR_STANDARD)));
@@ -983,8 +1007,7 @@ public class ModernMediaScanner implements MediaScanner {
 
     private static @NonNull ContentProviderOperation.Builder scanItemImage(long existingId,
             File file, BasicFileAttributes attrs, String mimeType, String volumeName) {
-        final ContentProviderOperation.Builder op = newUpsert(
-                MediaStore.Images.Media.getContentUri(volumeName), existingId);
+        final ContentProviderOperation.Builder op = newUpsert(volumeName, existingId);
         withGenericValues(op, file, attrs, mimeType);
 
         op.withValue(ImageColumns.DESCRIPTION, null);
@@ -1027,14 +1050,15 @@ public class ModernMediaScanner implements MediaScanner {
 
     private static @NonNull ContentProviderOperation.Builder scanItemFile(long existingId,
             File file, BasicFileAttributes attrs, String mimeType, String volumeName) {
-        final ContentProviderOperation.Builder op = newUpsert(
-                MediaStore.Files.getContentUri(volumeName), existingId);
+        final ContentProviderOperation.Builder op = newUpsert(volumeName, existingId);
         withGenericValues(op, file, attrs, mimeType);
 
         return op;
     }
 
-    private static @NonNull ContentProviderOperation.Builder newUpsert(Uri uri, long existingId) {
+    private static @NonNull ContentProviderOperation.Builder newUpsert(
+            @NonNull String volumeName, long existingId) {
+        final Uri uri = MediaStore.Files.getContentUri(volumeName);
         if (existingId == -1) {
             return ContentProviderOperation.newInsert(uri)
                     .withExceptionAllowed(true);
@@ -1058,7 +1082,8 @@ public class ModernMediaScanner implements MediaScanner {
         return Optional.empty();
     }
 
-    private static @NonNull <T> Optional<T> parseOptional(@Nullable T value) {
+    @VisibleForTesting
+    static @NonNull <T> Optional<T> parseOptional(@Nullable T value) {
         if (value == null) {
             return Optional.empty();
         } else if (value instanceof String && ((String) value).length() == 0) {
@@ -1074,7 +1099,8 @@ public class ModernMediaScanner implements MediaScanner {
         }
     }
 
-    private static @NonNull <T> Optional<T> parseOptionalOrZero(@Nullable T value) {
+    @VisibleForTesting
+    static @NonNull <T> Optional<T> parseOptionalOrZero(@Nullable T value) {
         if (value instanceof String && isZero((String) value)) {
             return Optional.empty();
         } else if (value instanceof Number && ((Number) value).intValue() == 0) {
@@ -1084,7 +1110,8 @@ public class ModernMediaScanner implements MediaScanner {
         }
     }
 
-    private static @NonNull Optional<Integer> parseOptionalNumerator(@Nullable String value) {
+    @VisibleForTesting
+    static @NonNull Optional<Integer> parseOptionalNumerator(@Nullable String value) {
         final Optional<String> parsedValue = parseOptional(value);
         if (parsedValue.isPresent()) {
             value = parsedValue.get();
@@ -1136,7 +1163,8 @@ public class ModernMediaScanner implements MediaScanner {
         }
     }
 
-    private static @NonNull Optional<Integer> parseOptionalOrientation(int orientation) {
+    @VisibleForTesting
+    static @NonNull Optional<Integer> parseOptionalOrientation(int orientation) {
         switch (orientation) {
             case ExifInterface.ORIENTATION_NORMAL: return Optional.of(0);
             case ExifInterface.ORIENTATION_ROTATE_90: return Optional.of(90);
@@ -1146,7 +1174,8 @@ public class ModernMediaScanner implements MediaScanner {
         }
     }
 
-    private static @NonNull Optional<String> parseOptionalVideoResolution(
+    @VisibleForTesting
+    static @NonNull Optional<String> parseOptionalVideoResolution(
             @NonNull MediaMetadataRetriever mmr) {
         final Optional<?> width = parseOptional(mmr.extractMetadata(METADATA_KEY_VIDEO_WIDTH));
         final Optional<?> height = parseOptional(mmr.extractMetadata(METADATA_KEY_VIDEO_HEIGHT));
@@ -1157,7 +1186,8 @@ public class ModernMediaScanner implements MediaScanner {
         }
     }
 
-    private static @NonNull Optional<String> parseOptionalImageResolution(
+    @VisibleForTesting
+    static @NonNull Optional<String> parseOptionalImageResolution(
             @NonNull MediaMetadataRetriever mmr) {
         final Optional<?> width = parseOptional(mmr.extractMetadata(METADATA_KEY_IMAGE_WIDTH));
         final Optional<?> height = parseOptional(mmr.extractMetadata(METADATA_KEY_IMAGE_HEIGHT));
@@ -1168,7 +1198,8 @@ public class ModernMediaScanner implements MediaScanner {
         }
     }
 
-    private static @NonNull Optional<String> parseOptionalResolution(
+    @VisibleForTesting
+    static @NonNull Optional<String> parseOptionalResolution(
             @NonNull ExifInterface exif) {
         final Optional<?> width = parseOptionalOrZero(
                 exif.getAttribute(ExifInterface.TAG_IMAGE_WIDTH));
@@ -1181,7 +1212,8 @@ public class ModernMediaScanner implements MediaScanner {
         }
     }
 
-    private static @NonNull Optional<Long> parseOptionalDate(@Nullable String date) {
+    @VisibleForTesting
+    static @NonNull Optional<Long> parseOptionalDate(@Nullable String date) {
         if (TextUtils.isEmpty(date)) return Optional.empty();
         try {
             synchronized (sDateFormat) {
@@ -1208,7 +1240,8 @@ public class ModernMediaScanner implements MediaScanner {
         }
     }
 
-    private static @NonNull Optional<Integer> parseOptionalTrack(
+    @VisibleForTesting
+    static @NonNull Optional<Integer> parseOptionalTrack(
             @NonNull MediaMetadataRetriever mmr) {
         final Optional<Integer> disc = parseOptionalNumerator(
                 mmr.extractMetadata(METADATA_KEY_DISC_NUMBER));
@@ -1265,7 +1298,7 @@ public class ModernMediaScanner implements MediaScanner {
     /**
      * Test if any parents of given directory should be considered hidden.
      */
-    static boolean isDirectoryHiddenRecursive(File dir) {
+    static boolean isDirectoryHiddenRecursive(@NonNull File dir) {
         Trace.beginSection("isDirectoryHiddenRecursive");
         try {
             while (dir != null) {
@@ -1283,7 +1316,8 @@ public class ModernMediaScanner implements MediaScanner {
     /**
      * Test if this given directory should be considered hidden.
      */
-    static boolean isDirectoryHidden(File dir) {
+    @VisibleForTesting
+    static boolean isDirectoryHidden(@NonNull File dir) {
         final File nomedia = new File(dir, ".nomedia");
 
         // Handle well-known paths that should always be visible or invisible,
@@ -1312,18 +1346,29 @@ public class ModernMediaScanner implements MediaScanner {
         return false;
     }
 
+    /**
+     * Test if this given file should be considered hidden.
+     */
     @VisibleForTesting
-    static boolean isFileAlbumArt(String name) {
-        return PATTERN_ALBUM_ART.matcher(name).matches();
+    static boolean isFileHidden(@NonNull File file) {
+        final String name = file.getName();
+
+        // Handle well-known file names that are pending or trashed; they
+        // normally appear hidden, but we give them special treatment
+        if (FileUtils.PATTERN_EXPIRES_FILE.matcher(name).matches()) {
+            return false;
+        }
+
+        // Otherwise fall back to file name
+        if (name.startsWith(".")) {
+            return true;
+        }
+        return false;
     }
 
-    /**
-     * Test if this given {@link Uri} is a
-     * {@link android.provider.MediaStore.Audio.Playlists} item.
-     */
-    static boolean isPlaylist(Uri uri) {
-        final List<String> path = uri.getPathSegments();
-        return (path.size() == 4) && path.get(1).equals("audio") && path.get(2).equals("playlists");
+    @VisibleForTesting
+    static boolean isFileAlbumArt(@NonNull File file) {
+        return PATTERN_ALBUM_ART.matcher(file.getName()).matches();
     }
 
     static boolean isZero(@NonNull String value) {
@@ -1338,7 +1383,7 @@ public class ModernMediaScanner implements MediaScanner {
         return true;
     }
 
-    static void logTroubleScanning(File file, Exception e) {
+    static void logTroubleScanning(@NonNull File file, @NonNull Exception e) {
         if (LOGW) Log.w(TAG, "Trouble scanning " + file + ": " + e);
     }
 }

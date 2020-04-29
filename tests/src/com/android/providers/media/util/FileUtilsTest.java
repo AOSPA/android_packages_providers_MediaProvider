@@ -16,6 +16,22 @@
 
 package com.android.providers.media.util;
 
+import static android.os.ParcelFileDescriptor.MODE_APPEND;
+import static android.os.ParcelFileDescriptor.MODE_CREATE;
+import static android.os.ParcelFileDescriptor.MODE_READ_ONLY;
+import static android.os.ParcelFileDescriptor.MODE_READ_WRITE;
+import static android.os.ParcelFileDescriptor.MODE_TRUNCATE;
+import static android.os.ParcelFileDescriptor.MODE_WRITE_ONLY;
+import static android.system.OsConstants.F_OK;
+import static android.system.OsConstants.O_APPEND;
+import static android.system.OsConstants.O_CREAT;
+import static android.system.OsConstants.O_RDONLY;
+import static android.system.OsConstants.O_RDWR;
+import static android.system.OsConstants.O_TRUNC;
+import static android.system.OsConstants.O_WRONLY;
+import static android.system.OsConstants.R_OK;
+import static android.system.OsConstants.W_OK;
+import static android.system.OsConstants.X_OK;
 import static android.text.format.DateUtils.DAY_IN_MILLIS;
 import static android.text.format.DateUtils.HOUR_IN_MILLIS;
 import static android.text.format.DateUtils.WEEK_IN_MILLIS;
@@ -24,11 +40,23 @@ import static com.android.providers.media.util.FileUtils.buildUniqueFile;
 import static com.android.providers.media.util.FileUtils.extractDisplayName;
 import static com.android.providers.media.util.FileUtils.extractFileExtension;
 import static com.android.providers.media.util.FileUtils.extractFileName;
+import static com.android.providers.media.util.FileUtils.extractRelativePath;
+import static com.android.providers.media.util.FileUtils.extractVolumeName;
+import static com.android.providers.media.util.FileUtils.extractVolumePath;
+import static com.android.providers.media.util.FileUtils.translateModeAccessToPosix;
+import static com.android.providers.media.util.FileUtils.translateModePfdToPosix;
+import static com.android.providers.media.util.FileUtils.translateModePosixToPfd;
+import static com.android.providers.media.util.FileUtils.translateModePosixToString;
+import static com.android.providers.media.util.FileUtils.translateModeStringToPosix;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
+
+import android.content.ContentValues;
+import android.provider.MediaStore;
+import android.provider.MediaStore.MediaColumns;
 
 import androidx.test.InstrumentationRegistry;
 import androidx.test.runner.AndroidJUnit4;
@@ -43,6 +71,7 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.Optional;
 
 @RunWith(AndroidJUnit4.class)
 public class FileUtilsTest {
@@ -70,6 +99,23 @@ public class FileUtilsTest {
         final File file = new File(mDeleteTarget, name);
         file.createNewFile();
         file.setLastModified(System.currentTimeMillis() - age);
+    }
+
+    @Test
+    public void testString() throws Exception {
+        final File file = new File(mTarget, String.valueOf(System.nanoTime()));
+
+        // Verify initial empty state
+        assertFalse(FileUtils.readString(file).isPresent());
+
+        // Verify simple writing and reading
+        FileUtils.writeString(file, Optional.of("meow"));
+        assertTrue(FileUtils.readString(file).isPresent());
+        assertEquals("meow", FileUtils.readString(file).get());
+
+        // Verify empty writing deletes file
+        FileUtils.writeString(file, Optional.empty());
+        assertFalse(FileUtils.readString(file).isPresent());
     }
 
     @Test
@@ -126,6 +172,77 @@ public class FileUtilsTest {
         assertTrue(FileUtils.deleteOlderFiles(mDeleteTarget, 2, 0));
         assertFalse(FileUtils.deleteOlderFiles(mDeleteTarget, 2, 0));
         assertDirContents("file1", "file2");
+    }
+
+    @Test
+    public void testTranslateMode() throws Exception {
+        assertTranslate("r", O_RDONLY, MODE_READ_ONLY);
+
+        assertTranslate("rw", O_RDWR | O_CREAT,
+                MODE_READ_WRITE | MODE_CREATE);
+        assertTranslate("rwt", O_RDWR | O_CREAT | O_TRUNC,
+                MODE_READ_WRITE | MODE_CREATE | MODE_TRUNCATE);
+        assertTranslate("rwa", O_RDWR | O_CREAT | O_APPEND,
+                MODE_READ_WRITE | MODE_CREATE | MODE_APPEND);
+
+        assertTranslate("w", O_WRONLY | O_CREAT,
+                MODE_WRITE_ONLY | MODE_CREATE | MODE_CREATE);
+        assertTranslate("wt", O_WRONLY | O_CREAT | O_TRUNC,
+                MODE_WRITE_ONLY | MODE_CREATE | MODE_TRUNCATE);
+        assertTranslate("wa", O_WRONLY | O_CREAT | O_APPEND,
+                MODE_WRITE_ONLY | MODE_CREATE | MODE_APPEND);
+    }
+
+    @Test
+    public void testMalformedTransate_int() throws Exception {
+        try {
+            // The non-standard Linux access mode 3 should throw
+            // an IllegalArgumentException.
+            translateModePosixToPfd(O_RDWR | O_WRONLY);
+            fail();
+        } catch (IllegalArgumentException expected) {
+        }
+    }
+
+    @Test
+    public void testMalformedTransate_string() throws Exception {
+        try {
+            // The non-standard Linux access mode 3 should throw
+            // an IllegalArgumentException.
+            translateModePosixToString(O_RDWR | O_WRONLY);
+            fail();
+        } catch (IllegalArgumentException expected) {
+        }
+    }
+
+    @Test
+    public void testTranslateMode_Invalid() throws Exception {
+        try {
+            translateModeStringToPosix("rwx");
+            fail();
+        } catch (IllegalArgumentException expected) {
+        }
+        try {
+            translateModeStringToPosix("");
+            fail();
+        } catch (IllegalArgumentException expected) {
+        }
+    }
+
+    @Test
+    public void testTranslateMode_Access() throws Exception {
+        assertEquals(O_RDONLY, translateModeAccessToPosix(F_OK));
+        assertEquals(O_RDONLY, translateModeAccessToPosix(R_OK));
+        assertEquals(O_WRONLY, translateModeAccessToPosix(W_OK));
+        assertEquals(O_RDWR, translateModeAccessToPosix(R_OK | W_OK));
+        assertEquals(O_RDWR, translateModeAccessToPosix(R_OK | W_OK | X_OK));
+    }
+
+    private static void assertTranslate(String string, int posix, int pfd) {
+        assertEquals(posix, translateModeStringToPosix(string));
+        assertEquals(string, translateModePosixToString(posix));
+        assertEquals(pfd, translateModePosixToPfd(posix));
+        assertEquals(posix, translateModePfdToPosix(pfd));
     }
 
     @Test
@@ -230,6 +347,15 @@ public class FileUtilsTest {
     }
 
     @Test
+    public void testBuildUniqueFile_increment_hidden() throws Exception {
+        assertNameEquals(".hidden.jpg",
+                FileUtils.buildUniqueFile(mTarget, "image/jpeg", ".hidden.jpg"));
+        new File(mTarget, ".hidden.jpg").createNewFile();
+        assertNameEquals(".hidden (1).jpg",
+                FileUtils.buildUniqueFile(mTarget, "image/jpeg", ".hidden.jpg"));
+    }
+
+    @Test
     public void testBuildUniqueFile_mimeless() throws Exception {
         assertNameEquals("test.jpg", FileUtils.buildUniqueFile(mTarget, "test.jpg"));
         new File(mTarget, "test.jpg").createNewFile();
@@ -290,6 +416,37 @@ public class FileUtilsTest {
                 buildUniqueFile(mDcimTarget, "IMG_20190102_030405.jpg"));
         assertNameEquals("IMG_20190102_030405~3.jpg",
                 buildUniqueFile(mDcimTarget, "IMG_20190102_030405~2.jpg"));
+    }
+
+    @Test
+    public void testExtractVolumePath() throws Exception {
+        assertEquals("/storage/emulated/0/",
+                extractVolumePath("/storage/emulated/0/foo.jpg"));
+        assertEquals("/storage/0000-0000/",
+                extractVolumePath("/storage/0000-0000/foo.jpg"));
+    }
+
+    @Test
+    public void testExtractVolumeName() throws Exception {
+        assertEquals(MediaStore.VOLUME_EXTERNAL_PRIMARY,
+                extractVolumeName("/storage/emulated/0/foo.jpg"));
+        assertEquals("0000-0000",
+                extractVolumeName("/storage/0000-0000/foo.jpg"));
+    }
+
+    @Test
+    public void testExtractRelativePath() throws Exception {
+        for (String prefix : new String[] {
+                "/storage/emulated/0/",
+                "/storage/0000-0000/"
+        }) {
+            assertEquals("/",
+                    extractRelativePath(prefix + "foo.jpg"));
+            assertEquals("DCIM/",
+                    extractRelativePath(prefix + "DCIM/foo.jpg"));
+            assertEquals("DCIM/My Vacation/",
+                    extractRelativePath(prefix + "DCIM/My Vacation/foo.jpg"));
+        }
     }
 
     @Test
@@ -371,6 +528,24 @@ public class FileUtilsTest {
         }) {
             assertEquals(probe, "", extractFileExtension(probe));
         }
+    }
+
+    @Test
+    public void testSanitizeValues() throws Exception {
+        final ContentValues values = new ContentValues();
+        values.put(MediaColumns.RELATIVE_PATH, "path/in\0valid/data/");
+        values.put(MediaColumns.DISPLAY_NAME, "inva\0lid");
+        FileUtils.sanitizeValues(values);
+        assertEquals("path/in_valid/data/", values.get(MediaColumns.RELATIVE_PATH));
+        assertEquals("inva_lid", values.get(MediaColumns.DISPLAY_NAME));
+    }
+
+    @Test
+    public void testSanitizeValues_Root() throws Exception {
+        final ContentValues values = new ContentValues();
+        values.put(MediaColumns.RELATIVE_PATH, "/");
+        FileUtils.sanitizeValues(values);
+        assertEquals("/", values.get(MediaColumns.RELATIVE_PATH));
     }
 
     private static File touch(File dir, String name) throws IOException {

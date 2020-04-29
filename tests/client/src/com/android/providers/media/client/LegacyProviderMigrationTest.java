@@ -20,6 +20,7 @@ import static android.provider.MediaStore.rewriteToLegacy;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import android.app.UiAutomation;
 import android.content.ContentProviderClient;
@@ -32,6 +33,7 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.ParcelFileDescriptor;
+import android.os.SystemClock;
 import android.os.storage.StorageManager;
 import android.provider.BaseColumns;
 import android.provider.MediaStore;
@@ -59,6 +61,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Verify that we preserve information from the old "legacy" provider from
@@ -73,6 +76,9 @@ public class LegacyProviderMigrationTest {
 
     // TODO: expand test to cover secondary storage devices
     private String mVolumeName = MediaStore.VOLUME_EXTERNAL_PRIMARY;
+
+    private static final long POLLING_TIMEOUT_MILLIS = TimeUnit.SECONDS.toMillis(10);
+    private static final long POLLING_SLEEP_MILLIS = 100;
 
     private Uri mExternalAudio;
     private Uri mExternalVideo;
@@ -100,6 +106,7 @@ public class LegacyProviderMigrationTest {
         final ContentValues values = new ContentValues();
         values.put(FileColumns.MEDIA_TYPE, mediaType);
         values.put(MediaColumns.DATA, file.getAbsolutePath());
+        values.put(MediaColumns.DISPLAY_NAME, file.getName());
         values.put(MediaColumns.MIME_TYPE, mimeType);
         values.put(MediaColumns.VOLUME_NAME, mVolumeName);
         values.put(MediaColumns.DATE_ADDED, String.valueOf(System.currentTimeMillis() / 1_000));
@@ -188,6 +195,9 @@ public class LegacyProviderMigrationTest {
         Assume.assumeNotNull(legacyProvider);
         Assume.assumeNotNull(modernProvider);
 
+        // Wait until everything calms down
+        MediaStore.waitForIdle(context.getContentResolver());
+
         // Clear data on the legacy provider so that we create a database
         executeShellCommand("pm clear " + legacyProvider.applicationInfo.packageName, ui);
 
@@ -206,11 +216,15 @@ public class LegacyProviderMigrationTest {
             // Drop media type from the columns we check, since it's implicitly
             // verified via the collection Uri
             values.remove(FileColumns.MEDIA_TYPE);
+
+            // Drop raw path, since we may rename pending or trashed files
+            values.remove(FileColumns.DATA);
         }
 
         // Clear data on the modern provider so that the initial scan recovers
         // metadata from the legacy provider
         executeShellCommand("pm clear " + modernProvider.applicationInfo.packageName, ui);
+        pollForExternalStorageState();
 
         // And force a scan to confirm upgraded data survives
         MediaStore.waitForIdle(context.getContentResolver());
@@ -222,9 +236,9 @@ public class LegacyProviderMigrationTest {
                 .acquireContentProviderClient(MediaStore.AUTHORITY)) {
             final Bundle extras = new Bundle();
             extras.putString(ContentResolver.QUERY_ARG_SQL_SELECTION,
-                    MediaColumns.DATA + "=?");
+                    MediaColumns.DISPLAY_NAME + "=?");
             extras.putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS,
-                    new String[] { legacyFile.getAbsolutePath() });
+                    new String[] { legacyFile.getName() });
             extras.putInt(MediaStore.QUERY_ARG_MATCH_PENDING, MediaStore.MATCH_INCLUDE);
             extras.putInt(MediaStore.QUERY_ARG_MATCH_TRASHED, MediaStore.MATCH_INCLUDE);
             extras.putInt(MediaStore.QUERY_ARG_MATCH_FAVORITE, MediaStore.MATCH_INCLUDE);
@@ -238,6 +252,17 @@ public class LegacyProviderMigrationTest {
                 assertEquals(values, actualValues);
             }
         }
+    }
+
+    private static void pollForExternalStorageState() throws Exception {
+        for (int i = 0; i < POLLING_TIMEOUT_MILLIS / POLLING_SLEEP_MILLIS; i++) {
+            if(Environment.getExternalStorageState(Environment.getExternalStorageDirectory())
+                    .equals(Environment.MEDIA_MOUNTED)) {
+                return;
+            }
+            SystemClock.sleep(POLLING_SLEEP_MILLIS);
+        }
+        fail("Timed out while waiting for ExternalStorageState to be MEDIA_MOUNTED");
     }
 
     public static String executeShellCommand(String command, UiAutomation uiAutomation)

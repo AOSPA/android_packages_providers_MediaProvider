@@ -62,6 +62,7 @@ import com.google.common.io.ByteStreams;
 import java.io.File;
 import java.io.FileDescriptor;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
@@ -80,7 +81,8 @@ public class TestUtils {
     public static final String INTENT_EXCEPTION = "com.android.tests.fused.exception";
     public static final String CREATE_FILE_QUERY = "com.android.tests.fused.createfile";
     public static final String DELETE_FILE_QUERY = "com.android.tests.fused.deletefile";
-
+    public static final String OPEN_FILE_FOR_READ_QUERY = "com.android.tests.fused.openfile_read";
+    public static final String OPEN_FILE_FOR_WRITE_QUERY = "com.android.tests.fused.openfile_write";
 
     public static final String STR_DATA1 = "Just some random text";
     public static final String STR_DATA2 = "More arbitrary stuff";
@@ -88,50 +90,93 @@ public class TestUtils {
     public static final byte[] BYTES_DATA1 = STR_DATA1.getBytes();
     public static final byte[] BYTES_DATA2 = STR_DATA2.getBytes();
 
+    // Root of external storage
+    public static final File EXTERNAL_STORAGE_DIR = Environment.getExternalStorageDirectory();
+    // Default top-level directories
+    public static final File ALARMS_DIR = new File(EXTERNAL_STORAGE_DIR,
+            Environment.DIRECTORY_ALARMS);
+    public static final File AUDIOBOOKS_DIR = new File(EXTERNAL_STORAGE_DIR,
+            Environment.DIRECTORY_AUDIOBOOKS);
+    public static final File DCIM_DIR = new File(EXTERNAL_STORAGE_DIR, Environment.DIRECTORY_DCIM);
+    public static final File DOCUMENTS_DIR = new File(EXTERNAL_STORAGE_DIR,
+            Environment.DIRECTORY_DOCUMENTS);
+    public static final File DOWNLOAD_DIR = new File(EXTERNAL_STORAGE_DIR,
+            Environment.DIRECTORY_DOWNLOADS);
+    public static final File MUSIC_DIR = new File(EXTERNAL_STORAGE_DIR,
+            Environment.DIRECTORY_MUSIC);
+    public static final File MOVIES_DIR = new File(EXTERNAL_STORAGE_DIR,
+            Environment.DIRECTORY_MOVIES);
+    public static final File NOTIFICATIONS_DIR = new File(EXTERNAL_STORAGE_DIR,
+            Environment.DIRECTORY_NOTIFICATIONS);
+    public static final File PICTURES_DIR = new File(EXTERNAL_STORAGE_DIR,
+            Environment.DIRECTORY_PICTURES);
+    public static final File PODCASTS_DIR = new File(EXTERNAL_STORAGE_DIR,
+            Environment.DIRECTORY_PODCASTS);
+    public static final File RINGTONES_DIR = new File(EXTERNAL_STORAGE_DIR,
+            Environment.DIRECTORY_RINGTONES);
+
+    public static final File ANDROID_DATA_DIR = new File(EXTERNAL_STORAGE_DIR, "Android/data");
+    public static final File ANDROID_MEDIA_DIR = new File(EXTERNAL_STORAGE_DIR, "Android/media");
+
     private static final long POLLING_TIMEOUT_MILLIS = TimeUnit.SECONDS.toMillis(10);
     private static final long POLLING_SLEEP_MILLIS = 100;
 
-    private static final UiAutomation sUiAutomation = InstrumentationRegistry.getInstrumentation()
-            .getUiAutomation();
+    /**
+     * Creates the top level default directories.
+     *
+     * <p>Those are usually created by MediaProvider, but some naughty tests might delete them
+     * and not restore them afterwards. so we make sure we create them before we make any
+     * assumptions about their existence.
+     */
+    public static void setupDefaultDirectories() {
+        for (File dir : new File [] { ALARMS_DIR, AUDIOBOOKS_DIR, DCIM_DIR,
+                DOCUMENTS_DIR, DOWNLOAD_DIR, MUSIC_DIR, MOVIES_DIR, NOTIFICATIONS_DIR,
+                PICTURES_DIR, PODCASTS_DIR, RINGTONES_DIR}) {
+            dir.mkdir();
+        }
+    }
 
     /**
      * Grants {@link Manifest.permission#GRANT_RUNTIME_PERMISSIONS} to the given package.
      */
-    public static void grantReadExternalStorage(String packageName) {
-        sUiAutomation.adoptShellPermissionIdentity("android.permission.GRANT_RUNTIME_PERMISSIONS");
+    public static void grantPermission(String packageName, String permission) {
+        UiAutomation uiAutomation = InstrumentationRegistry.getInstrumentation().getUiAutomation();
+        uiAutomation.adoptShellPermissionIdentity("android.permission.GRANT_RUNTIME_PERMISSIONS");
         try {
-            sUiAutomation.grantRuntimePermission(packageName,
-                    Manifest.permission.READ_EXTERNAL_STORAGE);
+            uiAutomation.grantRuntimePermission(packageName, permission);
             // Wait for OP_READ_EXTERNAL_STORAGE to get updated.
             SystemClock.sleep(1000);
         } finally {
-            sUiAutomation.dropShellPermissionIdentity();
+            uiAutomation.dropShellPermissionIdentity();
         }
     }
 
     /**
      * Revokes {@link Manifest.permission#GRANT_RUNTIME_PERMISSIONS} from the given package.
      */
-    public static void revokeReadExternalStorage(String packageName) {
-        sUiAutomation.adoptShellPermissionIdentity("android.permission.REVOKE_RUNTIME_PERMISSIONS");
+    public static void revokePermission(String packageName, String permission) {
+        UiAutomation uiAutomation = InstrumentationRegistry.getInstrumentation().getUiAutomation();
+        uiAutomation.adoptShellPermissionIdentity("android.permission.REVOKE_RUNTIME_PERMISSIONS");
         try {
-            sUiAutomation.revokeRuntimePermission(packageName,
-                    Manifest.permission.READ_EXTERNAL_STORAGE);
+            uiAutomation.revokeRuntimePermission(packageName, permission);
         } finally {
-            sUiAutomation.dropShellPermissionIdentity();
+            uiAutomation.dropShellPermissionIdentity();
         }
     }
 
     public static void adoptShellPermissionIdentity(String... permissions) {
-        sUiAutomation.adoptShellPermissionIdentity(permissions);
+        InstrumentationRegistry.getInstrumentation().getUiAutomation()
+                .adoptShellPermissionIdentity(permissions);
     }
 
     public static void dropShellPermissionIdentity() {
-        sUiAutomation.dropShellPermissionIdentity();
+        InstrumentationRegistry.getInstrumentation().getUiAutomation()
+                .dropShellPermissionIdentity();
     }
 
     public static String executeShellCommand(String cmd) throws Exception {
-        try (FileInputStream output = new FileInputStream (sUiAutomation.executeShellCommand(cmd)
+        UiAutomation uiAutomation = InstrumentationRegistry.getInstrumentation().getUiAutomation();
+        try (FileInputStream output = new FileInputStream (uiAutomation.executeShellCommand(cmd)
                 .getFileDescriptor())) {
             return new String(ByteStreams.toByteArray(output));
         }
@@ -166,7 +211,7 @@ public class TestUtils {
      * <p>This method drops shell permission identity.
      */
     public static boolean createFileAs(TestApp testApp, String path) throws Exception {
-        return createOrDeleteFileFromTestApp(testApp, path, CREATE_FILE_QUERY);
+        return getResultFromTestApp(testApp, path, CREATE_FILE_QUERY);
     }
 
     /**
@@ -175,7 +220,7 @@ public class TestUtils {
      * <p>This method drops shell permission identity.
      */
     public static boolean deleteFileAs(TestApp testApp, String path) throws Exception {
-        return createOrDeleteFileFromTestApp(testApp, path, DELETE_FILE_QUERY);
+        return getResultFromTestApp(testApp, path, DELETE_FILE_QUERY);
     }
 
     /**
@@ -192,14 +237,25 @@ public class TestUtils {
     }
 
     /**
+     * Makes the given {@code testApp} open a file for read or write.
+     *
+     * <p>This method drops shell permission identity.
+     */
+    public static boolean openFileAs(TestApp testApp, String path, boolean forWrite)
+            throws Exception {
+        return getResultFromTestApp(testApp, path,
+                forWrite ? OPEN_FILE_FOR_WRITE_QUERY : OPEN_FILE_FOR_READ_QUERY);
+    }
+
+    /**
      * Installs a {@link TestApp} and may grant it storage permissions.
      */
     public static void installApp(TestApp testApp, boolean grantStoragePermission)
             throws Exception {
-
+        UiAutomation uiAutomation = InstrumentationRegistry.getInstrumentation().getUiAutomation();
         try {
             final String packageName = testApp.getPackageName();
-            sUiAutomation.adoptShellPermissionIdentity(Manifest.permission.INSTALL_PACKAGES,
+            uiAutomation.adoptShellPermissionIdentity(Manifest.permission.INSTALL_PACKAGES,
                     Manifest.permission.DELETE_PACKAGES);
             if (InstallUtils.getInstalledVersion(packageName) != -1) {
                 Uninstall.packages(packageName);
@@ -207,10 +263,10 @@ public class TestUtils {
             Install.single(testApp).commit();
             assertThat(InstallUtils.getInstalledVersion(packageName)).isEqualTo(1);
             if (grantStoragePermission) {
-                grantReadExternalStorage(packageName);
+                grantPermission(packageName, Manifest.permission.READ_EXTERNAL_STORAGE);
             }
         } finally {
-            sUiAutomation.dropShellPermissionIdentity();
+            uiAutomation.dropShellPermissionIdentity();
         }
     }
 
@@ -218,14 +274,15 @@ public class TestUtils {
      * Uninstalls a {@link TestApp}.
      */
     public static void uninstallApp(TestApp testApp) throws Exception {
+        UiAutomation uiAutomation = InstrumentationRegistry.getInstrumentation().getUiAutomation();
         try {
             final String packageName = testApp.getPackageName();
-            sUiAutomation.adoptShellPermissionIdentity(Manifest.permission.DELETE_PACKAGES);
+            uiAutomation.adoptShellPermissionIdentity(Manifest.permission.DELETE_PACKAGES);
 
             Uninstall.packages(packageName);
             assertThat(InstallUtils.getInstalledVersion(packageName)).isEqualTo(-1);
         } finally {
-            sUiAutomation.dropShellPermissionIdentity();
+            uiAutomation.dropShellPermissionIdentity();
         }
     }
 
@@ -456,6 +513,22 @@ public class TestUtils {
         }
     }
 
+    public static boolean canOpen(File file, boolean forWrite) {
+        if (forWrite) {
+            try (FileOutputStream fis = new FileOutputStream(file)) {
+                return true;
+            } catch (IOException expected) {
+                return false;
+            }
+        } else {
+            try (FileInputStream fis = new FileInputStream(file)) {
+                return true;
+            } catch (IOException expected) {
+                return false;
+            }
+        }
+    }
+
     public static void pollForExternalStorageState() throws Exception {
         for (int i = 0; i < POLLING_TIMEOUT_MILLIS / POLLING_SLEEP_MILLIS; i++) {
             if(Environment.getExternalStorageState(Environment.getExternalStorageDirectory())
@@ -534,13 +607,14 @@ public class TestUtils {
      * <p>This method drops shell permission identity.
      */
     private static void forceStopApp(String packageName) throws Exception {
+        UiAutomation uiAutomation = InstrumentationRegistry.getInstrumentation().getUiAutomation();
         try {
-            sUiAutomation.adoptShellPermissionIdentity(Manifest.permission.FORCE_STOP_PACKAGES);
+            uiAutomation.adoptShellPermissionIdentity(Manifest.permission.FORCE_STOP_PACKAGES);
 
             getContext().getSystemService(ActivityManager.class).forceStopPackage(packageName);
             Thread.sleep(1000);
         } finally {
-            sUiAutomation.dropShellPermissionIdentity();
+            uiAutomation.dropShellPermissionIdentity();
         }
     }
 
@@ -621,7 +695,7 @@ public class TestUtils {
     /**
      * <p>This method drops shell permission identity.
      */
-    private static boolean createOrDeleteFileFromTestApp(TestApp testApp, String dirPath,
+    private static boolean getResultFromTestApp(TestApp testApp, String dirPath,
             String actionName) throws Exception {
         final CountDownLatch latch = new CountDownLatch(1);
         final boolean[] appOutput = new boolean[1];

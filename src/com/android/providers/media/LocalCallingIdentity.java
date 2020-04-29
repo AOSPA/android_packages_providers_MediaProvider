@@ -37,8 +37,6 @@ import static com.android.providers.media.util.PermissionUtils.checkPermissionWr
 import android.annotation.Nullable;
 import android.app.AppOpsManager;
 import android.app.compat.CompatChanges;
-import android.compat.annotation.ChangeId;
-import android.compat.annotation.Disabled;
 import android.content.ContentProvider;
 import android.content.Context;
 import android.content.pm.ApplicationInfo;
@@ -49,6 +47,9 @@ import android.os.Process;
 import android.os.SystemProperties;
 import android.os.UserHandle;
 import android.os.UserManager;
+import android.util.ArrayMap;
+
+import androidx.annotation.NonNull;
 
 import com.android.providers.media.util.LongArray;
 
@@ -57,64 +58,40 @@ public class LocalCallingIdentity {
     public final int pid;
     public final int uid;
     public final String packageNameUnchecked;
-    public @Nullable String featureId;
+    public @Nullable String attributionTag;
 
     private LocalCallingIdentity(Context context, int pid, int uid, String packageNameUnchecked,
-            @Nullable String featureId) {
+            @Nullable String attributionTag) {
         this.context = context;
         this.pid = pid;
         this.uid = uid;
         this.packageNameUnchecked = packageNameUnchecked;
-        this.featureId = featureId;
+        this.attributionTag = attributionTag;
     }
 
     /**
-     * Scoped Storage is on by default. However, it is not strictly enforced and there are multiple
-     * ways to opt out of scoped storage:
-     * <ul>
-     * <li>Target Sdk < Q</li>
-     * <li>Target Sdk = Q and has `requestLegacyExternalStorage` set in AndroidManifest.xml</li>
-     * <li>Target Sdk > Q: Upgrading from an app that was opted out of scoped storage and has
-     * `preserveLegacyExternalStorage` set in AndroidManifest.xml</li>
-     * </ul>
-     * This flag is enabled for all apps by default as Scoped Storage is enabled by default.
-     * Developers can disable this flag to opt out of Scoped Storage and have legacy storage
-     * workflow.
-     *
-     * Note: {@code FORCE_ENABLE_SCOPED_STORAGE} should also be disabled for apps to opt out of
-     * scoped storage.
-     * See https://developer.android.com/training/data-storage#scoped-storage for more information.
+     * See definition in {@link android.os.Environment}
      */
-    @ChangeId
     private static final long DEFAULT_SCOPED_STORAGE = 149924527L;
 
     /**
-     * Setting this flag strictly enforces Scoped Storage regardless of:
-     * <ul>
-     * <li>The value of Target Sdk</li>
-     * <li>The value of `requestLegacyExternalStorage` in AndroidManifest.xml</li>
-     * <li>The value of `preserveLegacyExternalStorage` in AndroidManifest.xml</li>
-     * </ul>
-     *
-     * Note: {@code DEFAULT_SCOPED_STORAGE} should also be enabled for apps to be enforced into
-     * scoped storage.
-     * See https://developer.android.com/training/data-storage#scoped-storage for more information.
+     * See definition in {@link android.os.Environment}
      */
-    @ChangeId
-    @Disabled
     private static final long FORCE_ENABLE_SCOPED_STORAGE = 132649864L;
+
+    private static final long UNKNOWN_ROW_ID = -1;
 
     public static LocalCallingIdentity fromBinder(Context context, ContentProvider provider) {
         String callingPackage = provider.getCallingPackageUnchecked();
         if (callingPackage == null) {
             callingPackage = context.getOpPackageName();
         }
-        String callingFeatureId = provider.getCallingFeatureId();
-        if (callingFeatureId == null) {
-            callingFeatureId = context.getFeatureId();
+        String callingAttributionTag = provider.getCallingAttributionTag();
+        if (callingAttributionTag == null) {
+            callingAttributionTag = context.getAttributionTag();
         }
         return new LocalCallingIdentity(context, Binder.getCallingPid(), Binder.getCallingUid(),
-                callingPackage, callingFeatureId);
+                callingPackage, callingAttributionTag);
     }
 
     public static LocalCallingIdentity fromExternal(Context context, int uid) {
@@ -123,6 +100,8 @@ public class LocalCallingIdentity {
             throw new IllegalArgumentException("UID " + uid + " has no associated package");
         }
         LocalCallingIdentity ident =  fromExternal(context, uid, sharedPackageNames[0], null);
+        ident.sharedPackageNames = sharedPackageNames;
+        ident.sharedPackageNamesResolved = true;
         if (uid == Process.SHELL_UID) {
             // This is useful for debugging/testing/development
             if (SystemProperties.getBoolean("persist.sys.fuse.shell.redaction-needed", false)) {
@@ -134,8 +113,8 @@ public class LocalCallingIdentity {
     }
 
     public static LocalCallingIdentity fromExternal(Context context, int uid, String packageName,
-            @Nullable String featureId) {
-        return new LocalCallingIdentity(context, -1, uid, packageName, featureId);
+            @Nullable String attributionTag) {
+        return new LocalCallingIdentity(context, -1, uid, packageName, attributionTag);
     }
 
     public static LocalCallingIdentity fromSelf(Context context) {
@@ -144,11 +123,11 @@ public class LocalCallingIdentity {
                 android.os.Process.myPid(),
                 android.os.Process.myUid(),
                 context.getOpPackageName(),
-                context.getFeatureId());
+                context.getAttributionTag());
 
         ident.packageName = ident.packageNameUnchecked;
         ident.packageNameResolved = true;
-        // Use ident.featureId from context, hence no change
+        // Use ident.attributionTag from context, hence no change
         ident.targetSdkVersion = Build.VERSION_CODES.CUR_DEVELOPMENT;
         ident.targetSdkVersionResolved = true;
         ident.hasPermission = ~(PERMISSION_IS_LEGACY_GRANTED | PERMISSION_IS_LEGACY_WRITE
@@ -251,7 +230,7 @@ public class LocalCallingIdentity {
 
         switch (permission) {
             case PERMISSION_IS_SYSTEM:
-                return isSystemInternal() || hasPermission(PERMISSION_MANAGE_EXTERNAL_STORAGE);
+                return isSystemInternal();
             case PERMISSION_IS_BACKUP:
                 return isBackupInternal();
             case PERMISSION_IS_LEGACY_GRANTED:
@@ -275,7 +254,7 @@ public class LocalCallingIdentity {
             case PERMISSION_WRITE_IMAGES:
                 return checkPermissionWriteImages(context, pid, uid, getPackageName());
             case PERMISSION_MANAGE_EXTERNAL_STORAGE:
-                return checkPermissionManageExternalStorage(context, pid, uid, packageName);
+                return checkPermissionManageExternalStorage(context, pid, uid, getPackageName());
             default:
                 return false;
         }
@@ -335,7 +314,7 @@ public class LocalCallingIdentity {
 
         if (context.checkPermission(ACCESS_MEDIA_LOCATION, pid, uid) == PERMISSION_DENIED
                 || context.getSystemService(AppOpsManager.class).noteProxyOpNoThrow(
-                permissionToOp(ACCESS_MEDIA_LOCATION), getPackageName(), uid, featureId, null)
+                permissionToOp(ACCESS_MEDIA_LOCATION), getPackageName(), uid, attributionTag, null)
                 != MODE_ALLOWED) {
             return true;
         }
@@ -360,5 +339,23 @@ public class LocalCallingIdentity {
                 ownedIds.remove(index);
             }
         }
+    }
+
+    private ArrayMap<String, Long> rowIdOfDeletedPaths = new ArrayMap<>();
+
+    public void addDeletedRowId(@NonNull String path, long id) {
+        rowIdOfDeletedPaths.put(path, id);
+    }
+
+    public void removeDeletedRowId(long id) {
+        int index = rowIdOfDeletedPaths.indexOfValue(id);
+        while (index > -1) {
+            rowIdOfDeletedPaths.removeAt(index);
+            index = rowIdOfDeletedPaths.indexOfValue(id);
+        }
+    }
+
+    public long getDeletedRowId(@NonNull String path) {
+        return rowIdOfDeletedPaths.getOrDefault(path, UNKNOWN_ROW_ID);
     }
 }

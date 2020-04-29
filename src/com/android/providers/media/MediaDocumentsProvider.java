@@ -30,7 +30,6 @@ import android.content.res.AssetFileDescriptor;
 import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.database.MatrixCursor.RowBuilder;
-import android.graphics.BitmapFactory;
 import android.graphics.Point;
 import android.media.ExifInterface;
 import android.media.MediaMetadata;
@@ -142,10 +141,6 @@ public class MediaDocumentsProvider extends DocumentsProvider {
 
     public static final String METADATA_KEY_AUDIO = "android.media.metadata.audio";
     public static final String METADATA_KEY_VIDEO = "android.media.metadata.video";
-    // Video lat/long are just that. Lat/long. Unlike EXIF where the values are
-    // in fact some funky string encoding. So we add our own contstant to convey coords.
-    public static final String METADATA_VIDEO_LATITUDE = "android.media.metadata.video:latitude";
-    public static final String METADATA_VIDEO_LONGITUTE = "android.media.metadata.video:longitude";
 
     /*
      * A mapping between media columns and metadata tag names. These keys of the
@@ -164,14 +159,10 @@ public class MediaDocumentsProvider extends DocumentsProvider {
         IMAGE_COLUMN_MAP.put(ImageColumns.WIDTH, ExifInterface.TAG_IMAGE_WIDTH);
         IMAGE_COLUMN_MAP.put(ImageColumns.HEIGHT, ExifInterface.TAG_IMAGE_LENGTH);
         IMAGE_COLUMN_MAP.put(ImageColumns.DATE_TAKEN, ExifInterface.TAG_DATETIME);
-        IMAGE_COLUMN_MAP.put(ImageColumns.LATITUDE, ExifInterface.TAG_GPS_LATITUDE);
-        IMAGE_COLUMN_MAP.put(ImageColumns.LONGITUDE, ExifInterface.TAG_GPS_LONGITUDE);
 
         VIDEO_COLUMN_MAP.put(VideoColumns.DURATION, MediaMetadata.METADATA_KEY_DURATION);
         VIDEO_COLUMN_MAP.put(VideoColumns.HEIGHT, ExifInterface.TAG_IMAGE_LENGTH);
         VIDEO_COLUMN_MAP.put(VideoColumns.WIDTH, ExifInterface.TAG_IMAGE_WIDTH);
-        VIDEO_COLUMN_MAP.put(VideoColumns.LATITUDE, METADATA_VIDEO_LATITUDE);
-        VIDEO_COLUMN_MAP.put(VideoColumns.LONGITUDE, METADATA_VIDEO_LONGITUTE);
         VIDEO_COLUMN_MAP.put(VideoColumns.DATE_TAKEN, MediaMetadata.METADATA_KEY_DATE);
 
         AUDIO_COLUMN_MAP.put(AudioColumns.ARTIST, MediaMetadata.METADATA_KEY_ARTIST);
@@ -1443,50 +1434,13 @@ public class MediaDocumentsProvider extends DocumentsProvider {
         throw new FileNotFoundException("No video found for bucket");
     }
 
-    private AssetFileDescriptor openImageThumbnailCleared(long id, Point size,
-            CancellationSignal signal) throws FileNotFoundException {
-        final ContentResolver resolver = getContext().getContentResolver();
-
-        final Uri uri = ContentUris.withAppendedId(Images.Media.EXTERNAL_CONTENT_URI, id);
-        final Bundle opts = new Bundle();
-        opts.putParcelable(EXTRA_SIZE, size);
-        return resolver.openTypedAssetFile(uri, "image/*", opts, signal);
-    }
-
     private AssetFileDescriptor openOrCreateImageThumbnailCleared(long id, Point size,
             CancellationSignal signal) throws FileNotFoundException {
-        final ContentResolver resolver = getContext().getContentResolver();
+        final Bundle opts = new Bundle();
+        opts.putParcelable(EXTRA_SIZE, size);
 
-        AssetFileDescriptor afd = openImageThumbnailCleared(id, size, signal);
-
-        if (afd == null) {
-            // No thumbnail yet, so generate. This is messy, since we drop the
-            // Bitmap on the floor, but its the least-complicated way.
-            final BitmapFactory.Options opts = new BitmapFactory.Options();
-            opts.inJustDecodeBounds = true;
-            Images.Thumbnails.getThumbnail(resolver, id, Images.Thumbnails.MINI_KIND, opts);
-
-            afd = openImageThumbnailCleared(id, size, signal);
-        }
-
-        if (afd != null) {
-            return afd;
-        }
-
-        // Phoey, fallback to full image
-        final Uri fullUri = ContentUris.withAppendedId(Images.Media.EXTERNAL_CONTENT_URI, id);
-        final ParcelFileDescriptor pfd = resolver.openFileDescriptor(fullUri, "r", signal);
-
-        final int orientation = queryOrientationForImage(id, signal);
-        final Bundle extras;
-        if (orientation != 0) {
-            extras = new Bundle(1);
-            extras.putInt(DocumentsContract.EXTRA_ORIENTATION, orientation);
-        } else {
-            extras = null;
-        }
-
-        return new AssetFileDescriptor(pfd, 0, AssetFileDescriptor.UNKNOWN_LENGTH, extras);
+        final Uri uri = ContentUris.withAppendedId(Images.Media.EXTERNAL_CONTENT_URI, id);
+        return getContext().getContentResolver().openTypedAssetFile(uri, "image/*", opts, signal);
     }
 
     private interface VideosBucketThumbnailQuery {
@@ -1517,57 +1471,13 @@ public class MediaDocumentsProvider extends DocumentsProvider {
         throw new FileNotFoundException("No video found for bucket");
     }
 
-    private AssetFileDescriptor openVideoThumbnailCleared(long id, Point size,
-            CancellationSignal signal) throws FileNotFoundException {
-        final ContentResolver resolver = getContext().getContentResolver();
-
-        final Uri uri = ContentUris.withAppendedId(Video.Media.EXTERNAL_CONTENT_URI, id);
-        final Bundle opts = new Bundle();
-        opts.putParcelable(EXTRA_SIZE, size);
-        return resolver.openTypedAssetFile(uri, "image/*", opts, signal);
-    }
-
     private AssetFileDescriptor openOrCreateVideoThumbnailCleared(long id, Point size,
             CancellationSignal signal) throws FileNotFoundException {
-        final ContentResolver resolver = getContext().getContentResolver();
+        final Bundle opts = new Bundle();
+        opts.putParcelable(EXTRA_SIZE, size);
 
-        AssetFileDescriptor afd = openVideoThumbnailCleared(id, size, signal);
-        if (afd == null) {
-            // No thumbnail yet, so generate. This is messy, since we drop the
-            // Bitmap on the floor, but its the least-complicated way.
-            final BitmapFactory.Options opts = new BitmapFactory.Options();
-            opts.inJustDecodeBounds = true;
-            Video.Thumbnails.getThumbnail(resolver, id, Video.Thumbnails.MINI_KIND, opts);
-
-            afd = openVideoThumbnailCleared(id, size, signal);
-        }
-        return afd;
-    }
-
-    private interface ImageOrientationQuery {
-        final String[] PROJECTION = new String[] {
-                ImageColumns.ORIENTATION };
-
-        final int ORIENTATION = 0;
-    }
-
-    private int queryOrientationForImage(long id, CancellationSignal signal) {
-        final ContentResolver resolver = getContext().getContentResolver();
-
-        Cursor cursor = null;
-        try {
-            cursor = resolver.query(Images.Media.EXTERNAL_CONTENT_URI,
-                    ImageOrientationQuery.PROJECTION, ImageColumns._ID + "=" + id, null, null,
-                    signal);
-            if (cursor.moveToFirst()) {
-                return cursor.getInt(ImageOrientationQuery.ORIENTATION);
-            } else {
-                Log.w(TAG, "Missing orientation data for " + id);
-                return 0;
-            }
-        } finally {
-            FileUtils.closeQuietly(cursor);
-        }
+        final Uri uri = ContentUris.withAppendedId(Video.Media.EXTERNAL_CONTENT_URI, id);
+        return getContext().getContentResolver().openTypedAssetFile(uri, "image/*", opts, signal);
     }
 
     private String cleanUpMediaDisplayName(String displayName) {

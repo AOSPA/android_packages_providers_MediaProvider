@@ -161,6 +161,10 @@ public final class MediaStore {
     public static final String VOLUME_EXTERNAL_PRIMARY = "external_primary";
 
     /** {@hide} */
+    public static final String RESOLVE_PLAYLIST_MEMBERS_CALL = "resolve_playlist_members";
+    /** {@hide} */
+    public static final String RUN_IDLE_MAINTENANCE_CALL = "run_idle_maintenance";
+    /** {@hide} */
     public static final String WAIT_FOR_IDLE_CALL = "wait_for_idle";
     /** {@hide} */
     public static final String SCAN_FILE_CALL = "scan_file";
@@ -768,7 +772,11 @@ public final class MediaStore {
      */
     public static void startLegacyMigration(@NonNull ContentResolver resolver,
             @NonNull String volumeName) {
-        resolver.call(AUTHORITY_LEGACY, START_LEGACY_MIGRATION_CALL, volumeName, null);
+        try {
+            resolver.call(AUTHORITY_LEGACY, START_LEGACY_MIGRATION_CALL, volumeName, null);
+        } catch (Exception e) {
+            Log.wtf(TAG, "Failed to deliver legacy migration event", e);
+        }
     }
 
     /**
@@ -780,7 +788,11 @@ public final class MediaStore {
      */
     public static void finishLegacyMigration(@NonNull ContentResolver resolver,
             @NonNull String volumeName) {
-        resolver.call(AUTHORITY_LEGACY, FINISH_LEGACY_MIGRATION_CALL, volumeName, null);
+        try {
+            resolver.call(AUTHORITY_LEGACY, FINISH_LEGACY_MIGRATION_CALL, volumeName, null);
+        } catch (Exception e) {
+            Log.wtf(TAG, "Failed to deliver legacy migration event", e);
+        }
     }
 
     private static @NonNull PendingIntent createRequest(@NonNull ContentResolver resolver,
@@ -3887,6 +3899,19 @@ public final class MediaStore {
         } catch (RemoteException e) {
             throw e.rethrowAsRuntimeException();
         }
+    }
+
+    /** {@hide} */
+    public static void resolvePlaylistMembers(@NonNull ContentResolver resolver,
+            @NonNull Uri playlistUri) {
+        final Bundle in = new Bundle();
+        in.putParcelable(EXTRA_URI, playlistUri);
+        resolver.call(AUTHORITY, RESOLVE_PLAYLIST_MEMBERS_CALL, null, in);
+    }
+
+    /** {@hide} */
+    public static void runIdleMaintenance(@NonNull ContentResolver resolver) {
+        resolver.call(AUTHORITY, RUN_IDLE_MAINTENANCE_CALL, null, null);
     }
 
     /**

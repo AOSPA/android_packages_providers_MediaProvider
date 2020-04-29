@@ -16,6 +16,25 @@
 
 package com.android.providers.media.util;
 
+import static android.os.ParcelFileDescriptor.MODE_APPEND;
+import static android.os.ParcelFileDescriptor.MODE_CREATE;
+import static android.os.ParcelFileDescriptor.MODE_READ_ONLY;
+import static android.os.ParcelFileDescriptor.MODE_READ_WRITE;
+import static android.os.ParcelFileDescriptor.MODE_TRUNCATE;
+import static android.os.ParcelFileDescriptor.MODE_WRITE_ONLY;
+import static android.system.OsConstants.F_OK;
+import static android.system.OsConstants.O_ACCMODE;
+import static android.system.OsConstants.O_APPEND;
+import static android.system.OsConstants.O_CREAT;
+import static android.system.OsConstants.O_RDONLY;
+import static android.system.OsConstants.O_RDWR;
+import static android.system.OsConstants.O_TRUNC;
+import static android.system.OsConstants.O_WRONLY;
+import static android.system.OsConstants.R_OK;
+import static android.system.OsConstants.W_OK;
+
+import static com.android.providers.media.util.DatabaseUtils.getAsBoolean;
+import static com.android.providers.media.util.DatabaseUtils.getAsLong;
 import static com.android.providers.media.util.Logging.TAG;
 
 import android.content.ClipDescription;
@@ -25,9 +44,9 @@ import android.net.Uri;
 import android.os.Environment;
 import android.os.storage.StorageManager;
 import android.provider.MediaStore;
-import android.provider.MediaStore.Images.ImageColumns;
 import android.provider.MediaStore.MediaColumns;
 import android.text.TextUtils;
+import android.text.format.DateUtils;
 import android.util.Log;
 import android.webkit.MimeTypeMap;
 
@@ -41,6 +60,12 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileVisitResult;
+import java.nio.file.FileVisitor;
+import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -48,6 +73,8 @@ import java.util.Comparator;
 import java.util.Iterator;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -114,6 +141,136 @@ public class FileUtils {
     }
 
     /**
+     * Shamelessly borrowed from {@code android.os.FileUtils}.
+     */
+    public static int translateModeStringToPosix(String mode) {
+        // Sanity check for invalid chars
+        for (int i = 0; i < mode.length(); i++) {
+            switch (mode.charAt(i)) {
+                case 'r':
+                case 'w':
+                case 't':
+                case 'a':
+                    break;
+                default:
+                    throw new IllegalArgumentException("Bad mode: " + mode);
+            }
+        }
+
+        int res = 0;
+        if (mode.startsWith("rw")) {
+            res = O_RDWR | O_CREAT;
+        } else if (mode.startsWith("w")) {
+            res = O_WRONLY | O_CREAT;
+        } else if (mode.startsWith("r")) {
+            res = O_RDONLY;
+        } else {
+            throw new IllegalArgumentException("Bad mode: " + mode);
+        }
+        if (mode.indexOf('t') != -1) {
+            res |= O_TRUNC;
+        }
+        if (mode.indexOf('a') != -1) {
+            res |= O_APPEND;
+        }
+        return res;
+    }
+
+    /**
+     * Shamelessly borrowed from {@code android.os.FileUtils}.
+     */
+    public static String translateModePosixToString(int mode) {
+        String res = "";
+        if ((mode & O_ACCMODE) == O_RDWR) {
+            res = "rw";
+        } else if ((mode & O_ACCMODE) == O_WRONLY) {
+            res = "w";
+        } else if ((mode & O_ACCMODE) == O_RDONLY) {
+            res = "r";
+        } else {
+            throw new IllegalArgumentException("Bad mode: " + mode);
+        }
+        if ((mode & O_TRUNC) == O_TRUNC) {
+            res += "t";
+        }
+        if ((mode & O_APPEND) == O_APPEND) {
+            res += "a";
+        }
+        return res;
+    }
+
+    /**
+     * Shamelessly borrowed from {@code android.os.FileUtils}.
+     */
+    public static int translateModePosixToPfd(int mode) {
+        int res = 0;
+        if ((mode & O_ACCMODE) == O_RDWR) {
+            res = MODE_READ_WRITE;
+        } else if ((mode & O_ACCMODE) == O_WRONLY) {
+            res = MODE_WRITE_ONLY;
+        } else if ((mode & O_ACCMODE) == O_RDONLY) {
+            res = MODE_READ_ONLY;
+        } else {
+            throw new IllegalArgumentException("Bad mode: " + mode);
+        }
+        if ((mode & O_CREAT) == O_CREAT) {
+            res |= MODE_CREATE;
+        }
+        if ((mode & O_TRUNC) == O_TRUNC) {
+            res |= MODE_TRUNCATE;
+        }
+        if ((mode & O_APPEND) == O_APPEND) {
+            res |= MODE_APPEND;
+        }
+        return res;
+    }
+
+    /**
+     * Shamelessly borrowed from {@code android.os.FileUtils}.
+     */
+    public static int translateModePfdToPosix(int mode) {
+        int res = 0;
+        if ((mode & MODE_READ_WRITE) == MODE_READ_WRITE) {
+            res = O_RDWR;
+        } else if ((mode & MODE_WRITE_ONLY) == MODE_WRITE_ONLY) {
+            res = O_WRONLY;
+        } else if ((mode & MODE_READ_ONLY) == MODE_READ_ONLY) {
+            res = O_RDONLY;
+        } else {
+            throw new IllegalArgumentException("Bad mode: " + mode);
+        }
+        if ((mode & MODE_CREATE) == MODE_CREATE) {
+            res |= O_CREAT;
+        }
+        if ((mode & MODE_TRUNCATE) == MODE_TRUNCATE) {
+            res |= O_TRUNC;
+        }
+        if ((mode & MODE_APPEND) == MODE_APPEND) {
+            res |= O_APPEND;
+        }
+        return res;
+    }
+
+    /**
+     * Shamelessly borrowed from {@code android.os.FileUtils}.
+     */
+    public static int translateModeAccessToPosix(int mode) {
+        if (mode == F_OK) {
+            // There's not an exact mapping, so we attempt a read-only open to
+            // determine if a file exists
+            return O_RDONLY;
+        } else if ((mode & (R_OK | W_OK)) == (R_OK | W_OK)) {
+            return O_RDWR;
+        } else if ((mode & R_OK) == R_OK) {
+            return O_RDONLY;
+        } else if ((mode & W_OK) == W_OK) {
+            return O_WRONLY;
+        } else {
+            throw new IllegalArgumentException("Bad mode: " + mode);
+        }
+    }
+
+    /**
      * Test if a file lives under the given directory, either as a direct child
      * or a distant grandchild.
      * <p>
@@ -177,22 +334,89 @@ public class FileUtils {
         return filePath.startsWith(dirPath);
     }
 
-    /** {@hide} */
-    public static boolean deleteContents(File dir) {
-        File[] files = dir.listFiles();
-        boolean success = true;
-        if (files != null) {
-            for (File file : files) {
-                if (file.isDirectory()) {
-                    success &= deleteContents(file);
-                }
-                if (!file.delete()) {
-                    Log.w(TAG, "Failed to delete " + file);
-                    success = false;
-                }
-            }
+    /**
+     * Write {@link String} to the given {@link File}. Deletes any existing file
+     * when the argument is {@link Optional#empty()}.
+     */
+    public static void writeString(@NonNull File file, @NonNull Optional<String> value)
+            throws IOException {
+        if (value.isPresent()) {
+            Files.write(file.toPath(), value.get().getBytes(StandardCharsets.UTF_8));
+        } else {
+            file.delete();
         }
-        return success;
+    }
+
+    /**
+     * Read given {@link File} as a single {@link String}. Returns
+     * {@link Optional#empty()} when the file doesn't exist.
+     */
+    public static @NonNull Optional<String> readString(@NonNull File file) throws IOException {
+        try {
+            final String value = new String(Files.readAllBytes(file.toPath()),
+                    StandardCharsets.UTF_8);
+            return Optional.of(value);
+        } catch (NoSuchFileException e) {
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Recursively walk the contents of the given {@link Path}, invoking the
+     * given {@link Consumer} for every file and directory encountered. This is
+     * typically used for recursively deleting a directory tree.
+     * <p>
+     * Gracefully attempts to process as much as possible in the face of any
+     * failures.
+     */
+    public static void walkFileTreeContents(@NonNull Path path, @NonNull Consumer<Path> operation) {
+        try {
+            Files.walkFileTree(path, new FileVisitor<Path>() {
+                @Override
+                public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                    if (!Objects.equals(path, file)) {
+                        operation.accept(file);
+                    }
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFileFailed(Path file, IOException e) {
+                    Log.w(TAG, "Failed to visit " + file, e);
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult postVisitDirectory(Path dir, IOException e) {
+                    if (!Objects.equals(path, dir)) {
+                        operation.accept(dir);
+                    }
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+        } catch (IOException e) {
+            Log.w(TAG, "Failed to walk " + path, e);
+        }
+    }
+
+    /**
+     * Recursively delete all contents inside the given directory. Gracefully
+     * attempts to delete as much as possible in the face of any failures.
+     *
+     * @deprecated if you're calling this from inside {@code MediaProvider}, you
+     *             likely want to call {@link #forEach} with a separate
+     *             invocation to invalidate FUSE entries.
+     */
+    @Deprecated
+    public static void deleteContents(@NonNull File dir) {
+        walkFileTreeContents(dir.toPath(), (path) -> {
+            path.toFile().delete();
+        });
     }
 
     private static boolean isValidFatFilenameChar(char c) {
@@ -563,6 +787,30 @@ public class FileUtils {
             "(?i)^/storage/[^/]+/(?:[0-9]+/)?(?:Android/sandbox/[^/]+/)?Download/.+");
     public static final Pattern PATTERN_DOWNLOADS_DIRECTORY = Pattern.compile(
             "(?i)^/storage/[^/]+/(?:[0-9]+/)?(?:Android/sandbox/[^/]+/)?Download/?");
+    public static final Pattern PATTERN_EXPIRES_FILE = Pattern.compile(
+            "(?i)^\\.(pending|trashed)-(\\d+)-(.+)$");
+
+    /**
+     * File prefix indicating that the file {@link MediaColumns#IS_PENDING}.
+     */
+    public static final String PREFIX_PENDING = "pending";
+
+    /**
+     * File prefix indicating that the file {@link MediaColumns#IS_TRASHED}.
+     */
+    public static final String PREFIX_TRASHED = "trashed";
+
+    /**
+     * Default duration that {@link MediaColumns#IS_PENDING} items should be
+     * preserved for until automatically cleaned by {@link #runIdleMaintenance}.
+     */
+    public static final long DEFAULT_DURATION_PENDING = DateUtils.WEEK_IN_MILLIS;
+
+    /**
+     * Default duration that {@link MediaColumns#IS_TRASHED} items should be
+     * preserved for until automatically cleaned by {@link #runIdleMaintenance}.
+     */
+    public static final long DEFAULT_DURATION_TRASHED = DateUtils.WEEK_IN_MILLIS;
 
     public static boolean isDownload(@NonNull String path) {
         return PATTERN_DOWNLOADS_FILE.matcher(path).matches();
@@ -600,6 +848,16 @@ public class FileUtils {
 
     private static @Nullable String normalizeUuid(@Nullable String fsUuid) {
         return fsUuid != null ? fsUuid.toLowerCase(Locale.US) : null;
+    }
+
+    public static @Nullable String extractVolumePath(@Nullable String data) {
+        if (data == null) return null;
+        final Matcher matcher = PATTERN_RELATIVE_PATH.matcher(data);
+        if (matcher.find()) {
+            return data.substring(0, matcher.end());
+        } else {
+            return null;
+        }
     }
 
     public static @Nullable String extractVolumeName(@Nullable String data) {
@@ -674,12 +932,22 @@ public class FileUtils {
         return null;
     }
 
-    public static void computeDataValues(@NonNull ContentValues values) {
+    /**
+     * Compute several scattered {@link MediaColumns} values from
+     * {@link MediaColumns#DATA}. This method performs no enforcement of
+     * argument validity.
+     */
+    public static void computeValuesFromData(@NonNull ContentValues values) {
         // Worst case we have to assume no bucket details
-        values.remove(ImageColumns.BUCKET_ID);
-        values.remove(ImageColumns.BUCKET_DISPLAY_NAME);
-        values.remove(ImageColumns.VOLUME_NAME);
-        values.remove(ImageColumns.RELATIVE_PATH);
+        values.remove(MediaColumns.VOLUME_NAME);
+        values.remove(MediaColumns.RELATIVE_PATH);
+        values.remove(MediaColumns.IS_DOWNLOAD);
+        values.remove(MediaColumns.IS_PENDING);
+        values.remove(MediaColumns.IS_TRASHED);
+        values.remove(MediaColumns.DATE_EXPIRES);
+        values.remove(MediaColumns.DISPLAY_NAME);
+        values.remove(MediaColumns.BUCKET_ID);
+        values.remove(MediaColumns.BUCKET_DISPLAY_NAME);
 
         final String data = values.getAsString(MediaColumns.DATA);
         if (TextUtils.isEmpty(data)) return;
@@ -687,18 +955,120 @@ public class FileUtils {
         final File file = new File(data);
         final File fileLower = new File(data.toLowerCase(Locale.ROOT));
 
-        values.put(ImageColumns.VOLUME_NAME, extractVolumeName(data));
-        values.put(ImageColumns.RELATIVE_PATH, extractRelativePath(data));
-        values.put(ImageColumns.DISPLAY_NAME, extractDisplayName(data));
+        values.put(MediaColumns.VOLUME_NAME, extractVolumeName(data));
+        values.put(MediaColumns.RELATIVE_PATH, extractRelativePath(data));
+        values.put(MediaColumns.IS_DOWNLOAD, isDownload(data));
+
+        final String displayName = extractDisplayName(data);
+        final Matcher matcher = FileUtils.PATTERN_EXPIRES_FILE.matcher(displayName);
+        if (matcher.matches()) {
+            values.put(MediaColumns.IS_PENDING,
+                    matcher.group(1).equals(FileUtils.PREFIX_PENDING) ? 1 : 0);
+            values.put(MediaColumns.IS_TRASHED,
+                    matcher.group(1).equals(FileUtils.PREFIX_TRASHED) ? 1 : 0);
+            values.put(MediaColumns.DATE_EXPIRES, Long.parseLong(matcher.group(2)));
+            values.put(MediaColumns.DISPLAY_NAME, matcher.group(3));
+        } else {
+            values.put(MediaColumns.IS_PENDING, 0);
+            values.put(MediaColumns.IS_TRASHED, 0);
+            values.putNull(MediaColumns.DATE_EXPIRES);
+            values.put(MediaColumns.DISPLAY_NAME, displayName);
+        }
 
         // Buckets are the parent directory
         final String parent = fileLower.getParent();
         if (parent != null) {
-            values.put(ImageColumns.BUCKET_ID, parent.hashCode());
+            values.put(MediaColumns.BUCKET_ID, parent.hashCode());
             // The relative path for files in the top directory is "/"
-            if (!"/".equals(values.getAsString(ImageColumns.RELATIVE_PATH))) {
-                values.put(ImageColumns.BUCKET_DISPLAY_NAME, file.getParentFile().getName());
+            if (!"/".equals(values.getAsString(MediaColumns.RELATIVE_PATH))) {
+                values.put(MediaColumns.BUCKET_DISPLAY_NAME, file.getParentFile().getName());
             }
+        }
+    }
+
+    /**
+     * Compute {@link MediaColumns#DATA} from several scattered
+     * {@link MediaColumns} values.  This method performs no enforcement of
+     * argument validity.
+     */
+    public static void computeDataFromValues(@NonNull ContentValues values,
+            @NonNull File volumePath) {
+        values.remove(MediaColumns.DATA);
+
+        final String displayName = values.getAsString(MediaColumns.DISPLAY_NAME);
+        final String resolvedDisplayName;
+        if (getAsBoolean(values, MediaColumns.IS_PENDING, false)) {
+            final long dateExpires = getAsLong(values, MediaColumns.DATE_EXPIRES,
+                    (System.currentTimeMillis() + DEFAULT_DURATION_PENDING) / 1000);
+            resolvedDisplayName = String.format(".%s-%d-%s",
+                    FileUtils.PREFIX_PENDING, dateExpires, displayName);
+        } else if (getAsBoolean(values, MediaColumns.IS_TRASHED, false)) {
+            final long dateExpires = getAsLong(values, MediaColumns.DATE_EXPIRES,
+                    (System.currentTimeMillis() + DEFAULT_DURATION_TRASHED) / 1000);
+            resolvedDisplayName = String.format(".%s-%d-%s",
+                    FileUtils.PREFIX_TRASHED, dateExpires, displayName);
+        } else {
+            resolvedDisplayName = displayName;
+        }
+
+        final File filePath = buildPath(volumePath,
+                values.getAsString(MediaColumns.RELATIVE_PATH), resolvedDisplayName);
+        values.put(MediaColumns.DATA, filePath.getAbsolutePath());
+    }
+
+    public static void sanitizeValues(@NonNull ContentValues values) {
+        final String[] relativePath = values.getAsString(MediaColumns.RELATIVE_PATH).split("/");
+        for (int i = 0; i < relativePath.length; i++) {
+            relativePath[i] = sanitizeDisplayName(relativePath[i]);
+        }
+        values.put(MediaColumns.RELATIVE_PATH,
+                String.join("/", relativePath) + "/");
+        values.put(MediaColumns.DISPLAY_NAME,
+                sanitizeDisplayName(values.getAsString(MediaColumns.DISPLAY_NAME)));
+    }
+
+    /** {@hide} **/
+    @Nullable
+    public static String getAbsoluteSanitizedPath(String path) {
+        final String[] pathSegments = sanitizePath(path);
+        if (pathSegments.length == 0) {
+            return null;
+        }
+        return path = "/" + String.join("/",
+                Arrays.copyOfRange(pathSegments, 1, pathSegments.length));
+    }
+
+    /** {@hide} */
+    public static @NonNull String[] sanitizePath(@Nullable String path) {
+        if (path == null) {
+            return new String[0];
+        } else {
+            final String[] segments = path.split("/");
+            // If the path corresponds to the top level directory, then we return an empty path
+            // which denotes the top level directory
+            if (segments.length == 0) {
+                return new String[] { "" };
+            }
+            for (int i = 0; i < segments.length; i++) {
+                segments[i] = sanitizeDisplayName(segments[i]);
+            }
+            return segments;
+        }
+    }
+
+    /**
+     * Sanitizes given name by appending '_' to make it non-hidden and mutating the file
+     * name to make it valid for a FAT filesystem.
+     * @hide
+     */
+    public static @Nullable String sanitizeDisplayName(@Nullable String name) {
+        if (name == null) {
+            return null;
+        } else if (name.startsWith(".")) {
+            // The resulting file must not be hidden.
+            return buildValidFatFilename("_" + name);
+        } else {
+            return buildValidFatFilename(name);
         }
     }
 }

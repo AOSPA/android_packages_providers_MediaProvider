@@ -16,12 +16,20 @@
 
 package com.android.providers.media.util;
 
+import static android.content.ContentResolver.QUERY_ARG_SQL_GROUP_BY;
+import static android.content.ContentResolver.QUERY_ARG_SQL_HAVING;
+import static android.content.ContentResolver.QUERY_ARG_SQL_LIMIT;
+import static android.content.ContentResolver.QUERY_ARG_SQL_SELECTION;
+import static android.content.ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS;
+import static android.content.ContentResolver.QUERY_ARG_SQL_SORT_ORDER;
+
 import android.annotation.NonNull;
 import android.annotation.Nullable;
 import android.content.ContentValues;
 import android.database.Cursor;
 import android.database.DatabaseUtils;
 import android.database.sqlite.SQLiteDatabase;
+import android.os.Bundle;
 import android.os.CancellationSignal;
 import android.os.OperationCanceledException;
 import android.provider.BaseColumns;
@@ -65,6 +73,18 @@ public class SQLiteQueryBuilder {
     private static final int STRICT_GRAMMAR = 1 << 2;
 
     private int mStrictFlags;
+
+    /**
+     * Raw SQL clause to obtain the value of {@link MediaColumns#_ID} from custom database function
+     * {@code _GET_ID} for INSERT operation.
+     */
+    private static final String GET_ID_FOR_INSERT_CLAUSE = "_GET_ID('%s')";
+
+    /**
+     * Raw SQL clause to obtain the value of {@link MediaColumns#_ID} from custom database function
+     * {@code _GET_ID} for UPDATE operation.
+     */
+    private static final String GET_ID_FOR_UPDATE_CLAUSE = "ifnull(_GET_ID('%s'), _id)";
 
     public SQLiteQueryBuilder() {
         mDistinct = false;
@@ -390,11 +410,25 @@ public class SQLiteQueryBuilder {
         s.append(' ');
     }
 
+    public Cursor query(DatabaseHelper helper, String[] projectionIn, Bundle queryArgs,
+            CancellationSignal cancellationSignal) {
+        final String selection = queryArgs.getString(QUERY_ARG_SQL_SELECTION);
+        final String[] selectionArgs = queryArgs.getStringArray(QUERY_ARG_SQL_SELECTION_ARGS);
+        final String groupBy = queryArgs.getString(QUERY_ARG_SQL_GROUP_BY);
+        final String having = queryArgs.getString(QUERY_ARG_SQL_HAVING);
+        final String sortOrder = queryArgs.getString(QUERY_ARG_SQL_SORT_ORDER);
+        final String limit = queryArgs.getString(QUERY_ARG_SQL_LIMIT);
+        return query(helper, projectionIn, selection, selectionArgs, groupBy, having, sortOrder,
+                limit, cancellationSignal);
+    }
+
     public Cursor query(DatabaseHelper helper, String[] projectionIn,
             String selection, String[] selectionArgs, String groupBy,
             String having, String sortOrder, String limit, CancellationSignal cancellationSignal) {
-        return query(helper.getReadableDatabase(), projectionIn, selection, selectionArgs, groupBy,
-                having, sortOrder, limit, cancellationSignal);
+        return helper.runWithoutTransaction((db) -> {
+            return query(db, projectionIn, selection, selectionArgs, groupBy,
+                    having, sortOrder, limit, cancellationSignal);
+        });
     }
 
     /**
@@ -492,8 +526,8 @@ public class SQLiteQueryBuilder {
     public long insert(@NonNull DatabaseHelper helper, @NonNull ContentValues values) {
         // We force wrap in a transaction to ensure that all mutations increment
         // the generation counter
-        return (int) helper.runWithTransaction(() -> {
-            return insert(helper.getWritableDatabase(), values);
+        return helper.runWithTransaction((db) -> {
+            return insert(db, values);
         });
     }
 
@@ -536,8 +570,8 @@ public class SQLiteQueryBuilder {
             @Nullable String selection, @Nullable String[] selectionArgs) {
         // We force wrap in a transaction to ensure that all mutations increment
         // the generation counter
-        return (int) helper.runWithTransaction(() -> {
-            return update(helper.getWritableDatabase(), values, selection, selectionArgs);
+        return helper.runWithTransaction((db) -> {
+            return update(db, values, selection, selectionArgs);
         });
     }
 
@@ -622,8 +656,8 @@ public class SQLiteQueryBuilder {
             @Nullable String[] selectionArgs) {
         // We force wrap in a transaction to ensure that all mutations increment
         // the generation counter
-        return (int) helper.runWithTransaction(() -> {
-            return delete(helper.getWritableDatabase(), selection, selectionArgs);
+        return helper.runWithTransaction((db) -> {
+            return delete(db, selection, selectionArgs);
         });
     }
 
@@ -721,6 +755,7 @@ public class SQLiteQueryBuilder {
     }
 
     private void enforceStrictToken(@NonNull String token) {
+        if (TextUtils.isEmpty(token)) return;
         if (isTableOrColumn(token)) return;
         if (SQLiteTokenizer.isFunction(token)) return;
         if (SQLiteTokenizer.isType(token)) return;
@@ -817,6 +852,11 @@ public class SQLiteQueryBuilder {
             sql.append(',');
             sql.append(MediaColumns.GENERATION_MODIFIED);
         }
+        if (shouldAppendRowId(values)) {
+            sql.append(',');
+            sql.append(MediaColumns._ID);
+        }
+
         sql.append(") VALUES (");
         for (int i = 0; i < rawValues.size(); i++) {
             if (i > 0) {
@@ -833,6 +873,10 @@ public class SQLiteQueryBuilder {
             sql.append('(');
             sql.append(DatabaseHelper.CURRENT_GENERATION_CLAUSE);
             sql.append(')');
+        }
+        if (shouldAppendRowId(values)) {
+            sql.append(',');
+            sql.append(String.format(GET_ID_FOR_INSERT_CLAUSE, values.get(MediaColumns.DATA)));
         }
         sql.append(")");
         return sql.toString();
@@ -871,6 +915,12 @@ public class SQLiteQueryBuilder {
             sql.append('(');
             sql.append(DatabaseHelper.CURRENT_GENERATION_CLAUSE);
             sql.append(')');
+        }
+        if (shouldAppendRowId(values)) {
+            sql.append(',');
+            sql.append(MediaColumns._ID);
+            sql.append('=');
+            sql.append(String.format(GET_ID_FOR_UPDATE_CLAUSE, values.get(MediaColumns.DATA)));
         }
 
         final String where = computeWhere(selection);
@@ -1022,5 +1072,9 @@ public class SQLiteQueryBuilder {
         } else {
             return "(" + arg + ")";
         }
+    }
+
+    private static boolean shouldAppendRowId(ContentValues values) {
+        return !values.containsKey(MediaColumns._ID) && values.containsKey(MediaColumns.DATA);
     }
 }

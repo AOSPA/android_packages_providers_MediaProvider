@@ -74,7 +74,7 @@ public class DatabaseHelperTest {
     @Test
     public void testFilterVolumeNames() throws Exception {
         try (DatabaseHelper helper = new DatabaseHelperR(getContext(), TEST_CLEAN_DB)) {
-            SQLiteDatabase db = helper.getWritableDatabase();
+            SQLiteDatabase db = helper.getWritableDatabaseForTest();
             {
                 final ContentValues values = new ContentValues();
                 values.put(FileColumns.MEDIA_TYPE, FileColumns.MEDIA_TYPE_AUDIO);
@@ -114,42 +114,42 @@ public class DatabaseHelperTest {
 
             // Confirm that raw view knows everything
             assertEquals(asSet("Clocks", "Speed of Sound", "Beautiful Day"),
-                    queryValues(db, "audio", "title"));
+                    queryValues(helper, "audio", "title"));
 
             // By default, database only knows about primary storage
             assertEquals(asSet("Coldplay"),
-                    queryValues(db, "audio_artists", "artist"));
+                    queryValues(helper, "audio_artists", "artist"));
             assertEquals(asSet("A Rush of Blood"),
-                    queryValues(db, "audio_albums", "album"));
+                    queryValues(helper, "audio_albums", "album"));
             assertEquals(asSet("Rock"),
-                    queryValues(db, "audio_genres", "name"));
+                    queryValues(helper, "audio_genres", "name"));
 
             // Once we broaden mounted volumes, we know a lot more
             helper.setFilterVolumeNames(asSet(VOLUME_EXTERNAL_PRIMARY, "0000-0000"));
             assertEquals(asSet("Coldplay", "U2"),
-                    queryValues(db, "audio_artists", "artist"));
+                    queryValues(helper, "audio_artists", "artist"));
             assertEquals(asSet("A Rush of Blood", "X&Y", "All That You Can't Leave Behind"),
-                    queryValues(db, "audio_albums", "album"));
+                    queryValues(helper, "audio_albums", "album"));
             assertEquals(asSet("Rock", "Alternative rock"),
-                    queryValues(db, "audio_genres", "name"));
+                    queryValues(helper, "audio_genres", "name"));
 
             // And unmounting primary narrows us the other way
             helper.setFilterVolumeNames(asSet("0000-0000"));
             assertEquals(asSet("Coldplay", "U2"),
-                    queryValues(db, "audio_artists", "artist"));
+                    queryValues(helper, "audio_artists", "artist"));
             assertEquals(asSet("X&Y", "All That You Can't Leave Behind"),
-                    queryValues(db, "audio_albums", "album"));
+                    queryValues(helper, "audio_albums", "album"));
             assertEquals(asSet("Rock", "Alternative rock"),
-                    queryValues(db, "audio_genres", "name"));
+                    queryValues(helper, "audio_genres", "name"));
 
             // Finally fully unmounted means nothing
             helper.setFilterVolumeNames(asSet());
             assertEquals(asSet(),
-                    queryValues(db, "audio_artists", "artist"));
+                    queryValues(helper, "audio_artists", "artist"));
             assertEquals(asSet(),
-                    queryValues(db, "audio_albums", "album"));
+                    queryValues(helper, "audio_albums", "album"));
             assertEquals(asSet(),
-                    queryValues(db, "audio_genres", "name"));
+                    queryValues(helper, "audio_genres", "name"));
         }
     }
 
@@ -163,7 +163,7 @@ public class DatabaseHelperTest {
                 helper.endTransaction();
             }
 
-            helper.runWithTransaction(() -> {
+            helper.runWithTransaction((db) -> {
                 return 0;
             });
         }
@@ -188,7 +188,7 @@ public class DatabaseHelperTest {
             Class<? extends DatabaseHelper> after) throws Exception {
         try (DatabaseHelper helper = before.getConstructor(Context.class, String.class)
                 .newInstance(getContext(), TEST_DOWNGRADE_DB)) {
-            SQLiteDatabase db = helper.getWritableDatabase();
+            SQLiteDatabase db = helper.getWritableDatabaseForTest();
             {
                 final ContentValues values = new ContentValues();
                 values.put(FileColumns.DATA,
@@ -207,7 +207,7 @@ public class DatabaseHelperTest {
         // Downgrade will wipe data, but at least we don't crash
         try (DatabaseHelper helper = after.getConstructor(Context.class, String.class)
                 .newInstance(getContext(), TEST_DOWNGRADE_DB)) {
-            SQLiteDatabase db = helper.getWritableDatabase();
+            SQLiteDatabase db = helper.getWritableDatabaseForTest();
             try (Cursor c = db.query("files", null, null, null, null, null, null, null)) {
                 assertEquals(0, c.getCount());
             }
@@ -235,7 +235,7 @@ public class DatabaseHelperTest {
             Class<? extends DatabaseHelper> after) throws Exception {
         try (DatabaseHelper helper = before.getConstructor(Context.class, String.class)
                 .newInstance(getContext(), TEST_RECOMPUTE_DB)) {
-            SQLiteDatabase db = helper.getWritableDatabase();
+            SQLiteDatabase db = helper.getWritableDatabaseForTest();
             {
                 final ContentValues values = new ContentValues();
                 values.put(FileColumns.DATA,
@@ -299,7 +299,7 @@ public class DatabaseHelperTest {
 
         try (DatabaseHelper helper = after.getConstructor(Context.class, String.class)
                 .newInstance(getContext(), TEST_RECOMPUTE_DB)) {
-            SQLiteDatabase db = helper.getWritableDatabase();
+            SQLiteDatabase db = helper.getWritableDatabaseForTest();
             try (Cursor c = db.query("files", null, FileColumns.DISPLAY_NAME + "='global.jpg'",
                     null, null, null, null)) {
                 assertEquals(1, c.getCount());
@@ -369,18 +369,18 @@ public class DatabaseHelperTest {
             Class<? extends DatabaseHelper> after) throws Exception {
         try (DatabaseHelper helper = before.getConstructor(Context.class, String.class)
                 .newInstance(getContext(), TEST_UPGRADE_DB)) {
-            SQLiteDatabase db = helper.getWritableDatabase();
+            SQLiteDatabase db = helper.getWritableDatabaseForTest();
         }
 
         try (DatabaseHelper helper = after.getConstructor(Context.class, String.class)
                 .newInstance(getContext(), TEST_UPGRADE_DB)) {
-            SQLiteDatabase db = helper.getWritableDatabase();
+            SQLiteDatabase db = helper.getWritableDatabaseForTest();
 
             // Create a second isolated instance from scratch and assert that
             // upgraded schema is identical
             try (DatabaseHelper helper2 = after.getConstructor(Context.class, String.class)
                     .newInstance(getContext(), TEST_CLEAN_DB)) {
-                SQLiteDatabase db2 = helper2.getWritableDatabase();
+                SQLiteDatabase db2 = helper2.getWritableDatabaseForTest();
 
                 try (Cursor c1 = db.query("sqlite_master",
                         null, null, null, null, null, SQLITE_MASTER_ORDER_BY);
@@ -411,10 +411,10 @@ public class DatabaseHelperTest {
         return new ArraySet<>(Arrays.asList(vars));
     }
 
-    private static Set<String> queryValues(@NonNull SQLiteDatabase db, @NonNull String table,
+    private static Set<String> queryValues(@NonNull DatabaseHelper helper, @NonNull String table,
             @NonNull String columnName) {
-        try (Cursor c = db.query(table, new String[] { columnName },
-                null, null, null, null, null)) {
+        try (Cursor c = helper.getWritableDatabaseForTest().query(table,
+                new String[] { columnName }, null, null, null, null, null)) {
             final ArraySet<String> res = new ArraySet<>();
             while (c.moveToNext()) {
                 res.add(c.getString(0));
@@ -426,7 +426,7 @@ public class DatabaseHelperTest {
     private static class DatabaseHelperO extends DatabaseHelper {
         public DatabaseHelperO(Context context, String name) {
             super(context, name, DatabaseHelper.VERSION_O,
-                    false, false, true, Column.class, null, null, null);
+                    false, false, true, Column.class, null, null, null, null);
         }
 
         @Override
@@ -438,7 +438,7 @@ public class DatabaseHelperTest {
     private static class DatabaseHelperP extends DatabaseHelper {
         public DatabaseHelperP(Context context, String name) {
             super(context, name, DatabaseHelper.VERSION_P,
-                    false, false, true, Column.class, null, null, null);
+                    false, false, true, Column.class, null, null, null, null);
         }
 
         @Override
@@ -450,7 +450,7 @@ public class DatabaseHelperTest {
     private static class DatabaseHelperQ extends DatabaseHelper {
         public DatabaseHelperQ(Context context, String name) {
             super(context, name, DatabaseHelper.VERSION_Q,
-                    false, false, true, Column.class, null, null, null);
+                    false, false, true, Column.class, null, null, null, null);
         }
 
         @Override
@@ -462,7 +462,7 @@ public class DatabaseHelperTest {
     private static class DatabaseHelperR extends DatabaseHelper {
         public DatabaseHelperR(Context context, String name) {
             super(context, name, DatabaseHelper.VERSION_R,
-                    false, false, true, Column.class, null, null, null);
+                    false, false, true, Column.class, null, null, null, null);
         }
     }
 

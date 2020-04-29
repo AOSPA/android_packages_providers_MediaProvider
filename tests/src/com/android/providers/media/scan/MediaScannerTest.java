@@ -80,7 +80,12 @@ public class MediaScannerTest {
 
             final ProviderInfo info = base.getPackageManager()
                     .resolveContentProvider(MediaStore.AUTHORITY, 0);
-            mProvider = new MediaProvider();
+            mProvider = new MediaProvider() {
+                @Override
+                public boolean isFuseThread() {
+                    return false;
+                }
+            };
             mProvider.attachInfo(this, info);
             mResolver.addProvider(MediaStore.AUTHORITY, mProvider);
 

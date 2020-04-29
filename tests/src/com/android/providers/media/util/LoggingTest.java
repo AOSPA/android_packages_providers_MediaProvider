@@ -42,6 +42,11 @@ public class LoggingTest {
         Logging.initPersistent(mTarget);
     }
 
+    @Test
+    public void testConstructor() throws Exception {
+        new Logging();
+    }
+
     /**
      * Verify that a logged message makes it round-trip.
      */
@@ -76,6 +81,9 @@ public class LoggingTest {
         for (int i = 0; i < 32; i++) {
             Logging.logPersistent(msg);
         }
+        assertEquals(3, mTarget.listFiles().length);
+
+        Logging.trimPersistent();
         assertEquals(3, mTarget.listFiles().length);
     }
 }

@@ -33,6 +33,9 @@ import org.junit.runner.RunWith;
  */
 @RunWith(DeviceJUnit4ClassRunner.class)
 public class FuseDaemonHostTest extends BaseHostJUnit4Test {
+
+    private boolean isExternalStorageSetup = false;
+
     /**
      * Runs the given phase of FilePathAccessTest by calling into the device.
      * Throws an exception if the test phase fails.
@@ -47,8 +50,16 @@ public class FuseDaemonHostTest extends BaseHostJUnit4Test {
         return getDevice().executeShellCommand(cmd);
     }
 
+    private void setupExternalStorage() throws Exception {
+        if (!isExternalStorageSetup) {
+            runDeviceTest("setupExternalStorage");
+            isExternalStorageSetup = true;
+        }
+    }
+
     @Before
     public void setup() throws Exception {
+        setupExternalStorage();
         executeShellCommand("mkdir /sdcard/Android/data/com.android.shell -m 2770");
         executeShellCommand("mkdir /sdcard/Android/data/com.android.shell/files -m 2770");
     }
@@ -148,6 +159,23 @@ public class FuseDaemonHostTest extends BaseHostJUnit4Test {
         runDeviceTest("testOpenContentResolverDup");
         runDeviceTest("testContentResolverDelete");
         runDeviceTest("testContentResolverUpdate");
+    }
+
+    @Test
+    public void testCallingIdentityCacheInvalidation() throws Exception {
+        // General IO access
+        runDeviceTest("testReadStorageInvalidation");
+        runDeviceTest("testWriteStorageInvalidation");
+        // File manager access
+        runDeviceTest("testManageStorageInvalidation");
+        // Default gallery
+        runDeviceTest("testWriteImagesInvalidation");
+        runDeviceTest("testWriteVideoInvalidation");
+        // EXIF access
+        runDeviceTest("testAccessMediaLocationInvalidation");
+
+        runDeviceTest("testAppUpdateInvalidation");
+        runDeviceTest("testAppReinstallInvalidation");
     }
 
     @Test
@@ -252,5 +280,15 @@ public class FuseDaemonHostTest extends BaseHostJUnit4Test {
     @Test
     public void testSystemGalleryCanRenameImageAndVideoDirs() throws Exception {
         runDeviceTest("testSystemGalleryCanRenameImageAndVideoDirs");
+    }
+
+    @Test
+    public void testCreateCanRestoreDeletedRowId() throws Exception {
+        runDeviceTest("testCreateCanRestoreDeletedRowId");
+    }
+
+    @Test
+    public void testRenameCanRestoreDeletedRowId() throws Exception {
+        runDeviceTest("testRenameCanRestoreDeletedRowId");
     }
 }

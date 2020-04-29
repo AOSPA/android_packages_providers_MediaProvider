@@ -92,13 +92,13 @@ void com_android_providers_media_FuseDaemon_invalidate_fuse_dentry_cache(JNIEnv*
             return;
         }
 
+        CHECK(pthread_getspecific(fuse::MediaProviderWrapper::gJniEnvKey) == nullptr);
         daemon->InvalidateFuseDentryCache(utf_chars_path.c_str());
     }
     // TODO(b/145741152): Throw exception
 }
 
 bool com_android_providers_media_FuseDaemon_is_fuse_thread(JNIEnv* env, jclass clazz) {
-    LOG(VERBOSE) << "Checking if FUSE thread...";
     return pthread_getspecific(fuse::MediaProviderWrapper::gJniEnvKey) != nullptr;
 }
 

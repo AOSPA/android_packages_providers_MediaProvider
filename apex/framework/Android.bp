@@ -25,18 +25,16 @@ java_library {
 
     installable: true,
 
-    sdk_version: "core_current",
+    sdk_version: "module_current",
     libs: [
-        // The order matters. android_system_* library should come later.
         "framework_mediaprovider_annotation",
-        "android_system_stubs_current",
         "unsupportedappusage",
     ],
 
     plugins: ["java_api_finder"],
 
     hostdex: true, // for hiddenapi check
-    visibility: ["//packages/providers/MediaProvider/apex:__subpackages__"],
+    visibility: ["//packages/providers/MediaProvider:__subpackages__"],
     apex_available: [
         "com.android.mediaprovider",
         "test_com.android.mediaprovider",
@@ -55,7 +53,6 @@ stubs_defaults {
     name: "framework-mediaprovider-stubs-srcs-defaults",
     srcs: [
         ":framework-mediaprovider-sources",
-        ":framework-mediaprovider-annotation-sources",
     ],
     sdk_version: "system_current",
 }
@@ -95,19 +92,19 @@ droidstubs {
 java_library {
     name: "framework-mediaprovider-stubs-publicapi",
     srcs: [":framework-mediaprovider-stubs-srcs-publicapi"],
-    sdk_version: "current",
+    defaults: ["framework-module-stubs-lib-defaults-publicapi"],
 }
 
 java_library {
     name: "framework-mediaprovider-stubs-systemapi",
     srcs: [":framework-mediaprovider-stubs-srcs-systemapi"],
-    sdk_version: "system_current",
+    defaults: ["framework-module-stubs-lib-defaults-systemapi"],
 }
 
 java_library {
     name: "framework-mediaprovider-stubs-module_libs_api",
     srcs: [":framework-mediaprovider-stubs-srcs-module_libs_api"],
-    sdk_version: "system_current",
+    defaults: ["framework-module-stubs-lib-defaults-module_libs_api"],
 }
 
 java_library {

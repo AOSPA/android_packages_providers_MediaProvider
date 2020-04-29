@@ -20,8 +20,18 @@ import static com.android.providers.media.scan.MediaScanner.REASON_UNKNOWN;
 import static com.android.providers.media.scan.MediaScannerTest.stage;
 import static com.android.providers.media.scan.ModernMediaScanner.isDirectoryHidden;
 import static com.android.providers.media.scan.ModernMediaScanner.isFileAlbumArt;
+import static com.android.providers.media.scan.ModernMediaScanner.isFileHidden;
+import static com.android.providers.media.scan.ModernMediaScanner.parseOptional;
+import static com.android.providers.media.scan.ModernMediaScanner.parseOptionalDate;
 import static com.android.providers.media.scan.ModernMediaScanner.parseOptionalDateTaken;
+import static com.android.providers.media.scan.ModernMediaScanner.parseOptionalImageResolution;
 import static com.android.providers.media.scan.ModernMediaScanner.parseOptionalMimeType;
+import static com.android.providers.media.scan.ModernMediaScanner.parseOptionalNumerator;
+import static com.android.providers.media.scan.ModernMediaScanner.parseOptionalOrZero;
+import static com.android.providers.media.scan.ModernMediaScanner.parseOptionalOrientation;
+import static com.android.providers.media.scan.ModernMediaScanner.parseOptionalResolution;
+import static com.android.providers.media.scan.ModernMediaScanner.parseOptionalTrack;
+import static com.android.providers.media.scan.ModernMediaScanner.parseOptionalVideoResolution;
 import static com.android.providers.media.scan.ModernMediaScanner.parseOptionalYear;
 
 import static org.junit.Assert.assertEquals;
@@ -29,6 +39,9 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import android.Manifest;
 import android.content.ContentResolver;
@@ -37,6 +50,7 @@ import android.content.Context;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.media.ExifInterface;
+import android.media.MediaMetadataRetriever;
 import android.net.Uri;
 import android.os.ParcelFileDescriptor;
 import android.provider.MediaStore;
@@ -124,6 +138,94 @@ public class ModernMediaScannerTest {
         // The other direction isn't allowed
         assertEquals(Optional.empty(),
                 parseOptionalMimeType("audio/mp4", "video/mp4"));
+    }
+
+    @Test
+    public void testParseOptional() throws Exception {
+        assertFalse(parseOptional(null).isPresent());
+        assertFalse(parseOptional("").isPresent());
+        assertFalse(parseOptional(" ").isPresent());
+        assertFalse(parseOptional("-1").isPresent());
+
+        assertFalse(parseOptional(-1).isPresent());
+        assertTrue(parseOptional(0).isPresent());
+        assertTrue(parseOptional(1).isPresent());
+
+        assertEquals("meow", parseOptional("meow").get());
+        assertEquals(42, (int) parseOptional(42).get());
+    }
+
+    @Test
+    public void testParseOptionalOrZero() throws Exception {
+        assertFalse(parseOptionalOrZero(-1).isPresent());
+        assertFalse(parseOptionalOrZero(0).isPresent());
+        assertTrue(parseOptionalOrZero(1).isPresent());
+    }
+
+    @Test
+    public void testParseOptionalNumerator() throws Exception {
+        assertEquals(12, (int) parseOptionalNumerator("12").get());
+        assertEquals(12, (int) parseOptionalNumerator("12/24").get());
+
+        assertFalse(parseOptionalNumerator("/24").isPresent());
+    }
+
+    @Test
+    public void testParseOptionalOrientation() throws Exception {
+        assertEquals(0,
+                (int) parseOptionalOrientation(ExifInterface.ORIENTATION_NORMAL).get());
+        assertEquals(90,
+                (int) parseOptionalOrientation(ExifInterface.ORIENTATION_ROTATE_90).get());
+        assertEquals(180,
+                (int) parseOptionalOrientation(ExifInterface.ORIENTATION_ROTATE_180).get());
+        assertEquals(270,
+                (int) parseOptionalOrientation(ExifInterface.ORIENTATION_ROTATE_270).get());
+
+        // We can't represent this as an orientation
+        assertFalse(parseOptionalOrientation(ExifInterface.ORIENTATION_TRANSPOSE).isPresent());
+    }
+
+    @Test
+    public void testParseOptionalImageResolution() throws Exception {
+        final MediaMetadataRetriever mmr = mock(MediaMetadataRetriever.class);
+        when(mmr.extractMetadata(eq(MediaMetadataRetriever.METADATA_KEY_IMAGE_WIDTH)))
+                .thenReturn("640");
+        when(mmr.extractMetadata(eq(MediaMetadataRetriever.METADATA_KEY_IMAGE_HEIGHT)))
+                .thenReturn("480");
+        assertEquals("640\u00d7480", parseOptionalImageResolution(mmr).get());
+    }
+
+    @Test
+    public void testParseOptionalVideoResolution() throws Exception {
+        final MediaMetadataRetriever mmr = mock(MediaMetadataRetriever.class);
+        when(mmr.extractMetadata(eq(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)))
+                .thenReturn("640");
+        when(mmr.extractMetadata(eq(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)))
+                .thenReturn("480");
+        assertEquals("640\u00d7480", parseOptionalVideoResolution(mmr).get());
+    }
+
+    @Test
+    public void testParseOptionalResolution() throws Exception {
+        final ExifInterface exif = mock(ExifInterface.class);
+        when(exif.getAttribute(ExifInterface.TAG_IMAGE_WIDTH)).thenReturn("640");
+        when(exif.getAttribute(ExifInterface.TAG_IMAGE_LENGTH)).thenReturn("480");
+        assertEquals("640\u00d7480", parseOptionalResolution(exif).get());
+    }
+
+    @Test
+    public void testParseOptionalDate() throws Exception {
+        assertEquals(1577836800000L, (long) parseOptionalDate("20200101T000000").get());
+    }
+
+    @Test
+    public void testParseOptionalTrack() throws Exception {
+        final MediaMetadataRetriever mmr = mock(MediaMetadataRetriever.class);
+        when(mmr.extractMetadata(eq(MediaMetadataRetriever.METADATA_KEY_DISC_NUMBER)))
+                .thenReturn("1/2");
+        when(mmr.extractMetadata(eq(MediaMetadataRetriever.METADATA_KEY_CD_TRACK_NUMBER)))
+                .thenReturn("4/12");
+        assertEquals(1004, (int) parseOptionalTrack(mmr).get());
     }
 
     @Test
@@ -289,6 +391,18 @@ public class ModernMediaScannerTest {
     }
 
     @Test
+    public void testIsFileHidden() throws Exception {
+        assertFalse(isFileHidden(
+                new File("/storage/emulated/0/DCIM/IMG1024.JPG")));
+        assertFalse(isFileHidden(
+                new File("/storage/emulated/0/DCIM/.pending-1577836800-IMG1024.JPG")));
+        assertFalse(isFileHidden(
+                new File("/storage/emulated/0/DCIM/.trashed-1577836800-IMG1024.JPG")));
+        assertTrue(isFileHidden(
+                new File("/storage/emulated/0/DCIM/.IMG1024.JPG")));
+    }
+
+    @Test
     public void testIsZero() throws Exception {
         assertFalse(ModernMediaScanner.isZero(""));
         assertFalse(ModernMediaScanner.isZero("meow"));
@@ -314,6 +428,11 @@ public class ModernMediaScannerTest {
     @Test
     public void testPlaylistWpl() throws Exception {
         doPlaylist(R.raw.test_wpl, "test.wpl");
+    }
+
+    @Test
+    public void testPlaylistXspf() throws Exception {
+        doPlaylist(R.raw.test_xspf, "test.xspf");
     }
 
     private void doPlaylist(int res, String name) throws Exception {
@@ -367,6 +486,28 @@ public class ModernMediaScannerTest {
             assertEquals(4, cursor.getCount());
             cursor.moveToNext();
             assertEquals("001.mp3", cursor.getString(0));
+            cursor.moveToNext();
+            assertEquals("003.mp3", cursor.getString(0));
+        }
+
+        // Replace media file in a completely different location, which normally
+        // wouldn't match the exact playlist path, but we're willing to perform
+        // a relaxed search
+        final File soundtracks = new File(mDir, "Soundtracks");
+        soundtracks.mkdirs();
+        stage(R.raw.test_audio, new File(soundtracks, "002.mp3"));
+        stage(res, new File(music, name));
+
+        mModern.scanDirectory(mDir, REASON_UNKNOWN);
+
+        try (Cursor cursor = mIsolatedResolver.query(membersUri, new String[] {
+                MediaColumns.DISPLAY_NAME
+        }, null, null, MediaStore.Audio.Playlists.Members.PLAY_ORDER + " ASC")) {
+            assertEquals(5, cursor.getCount());
+            cursor.moveToNext();
+            assertEquals("001.mp3", cursor.getString(0));
+            cursor.moveToNext();
+            assertEquals("002.mp3", cursor.getString(0));
             cursor.moveToNext();
             assertEquals("003.mp3", cursor.getString(0));
         }
@@ -444,6 +585,24 @@ public class ModernMediaScannerTest {
         file.delete();
         mModern.scanDirectory(mDir, REASON_UNKNOWN);
         assertQueryCount(0, MediaStore.Images.Media.EXTERNAL_CONTENT_URI);
+    }
+
+    /**
+     * All file formats are thoroughly tested by {@code CtsProviderTestCases},
+     * but to prove code coverage we also need to exercise manually here with a
+     * bare-bones scan operation.
+     */
+    @Test
+    public void testScan_Coverage() throws Exception {
+        stage(R.raw.test_audio, new File(mDir, "audio.mp3"));
+        stage(R.raw.test_video, new File(mDir, "video.mp4"));
+        stage(R.raw.test_image, new File(mDir, "image.jpg"));
+        stage(R.raw.test_m3u, new File(mDir, "playlist.m3u"));
+        stage(R.raw.test_srt, new File(mDir, "subtitle.srt"));
+        stage(R.raw.test_txt, new File(mDir, "document.txt"));
+        stage(R.raw.test_bin, new File(mDir, "random.bin"));
+
+        mModern.scanDirectory(mDir, REASON_UNKNOWN);
     }
 
     @Test
@@ -582,8 +741,7 @@ public class ModernMediaScannerTest {
                 "/storage/emulated/0/albumart1.jpg",
         }) {
             final File file = new File(path);
-            final String name = file.getName();
-            assertEquals(LegacyMediaScannerTest.isNonMediaFile(path), isFileAlbumArt(name));
+            assertEquals(LegacyMediaScannerTest.isNonMediaFile(path), isFileAlbumArt(file));
         }
 
         for (String path : new String[] {
@@ -591,8 +749,7 @@ public class ModernMediaScannerTest {
                 "/storage/emulated/0/albumartlarge.jpg",
         }) {
             final File file = new File(path);
-            final String name = file.getName();
-            assertTrue(isFileAlbumArt(name));
+            assertTrue(isFileAlbumArt(file));
         }
     }
 }
