@@ -20,6 +20,7 @@ import static com.android.providers.media.MediaProvider.AUDIO_MEDIA_ID;
 import static com.android.providers.media.MediaProvider.IMAGES_MEDIA_ID;
 import static com.android.providers.media.MediaProvider.VIDEO_MEDIA_ID;
 import static com.android.providers.media.MediaProvider.collectUris;
+import static com.android.providers.media.util.DatabaseUtils.getAsBoolean;
 import static com.android.providers.media.util.Logging.TAG;
 
 import android.app.Activity;
@@ -30,6 +31,7 @@ import android.content.ContentValues;
 import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
+import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.PackageManager.NameNotFoundException;
 import android.content.res.Resources;
@@ -50,7 +52,9 @@ import android.util.Log;
 import android.util.Size;
 import android.view.KeyEvent;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.WindowManager;
+import android.view.accessibility.AccessibilityEvent;
 import android.widget.ImageView;
 import android.widget.TextView;
 
@@ -64,6 +68,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 /**
@@ -88,6 +93,9 @@ public class PermissionActivity extends Activity {
     private String verb;
     private String data;
     private String volumeName;
+    private ApplicationInfo appInfo;
+
+    private TextView titleView;
 
     private static final String VERB_WRITE = "write";
     private static final String VERB_TRASH = "trash";
@@ -116,7 +124,8 @@ public class PermissionActivity extends Activity {
             uris = collectUris(getIntent().getExtras().getParcelable(MediaStore.EXTRA_CLIP_DATA));
             values = getIntent().getExtras().getParcelable(MediaStore.EXTRA_CONTENT_VALUES);
 
-            label = resolveCallingLabel();
+            appInfo = resolveCallingAppInfo();
+            label = resolveAppLabel(appInfo);
             verb = resolveVerb();
             data = resolveData();
             volumeName = MediaStore.getVolumeName(uris.get(0));
@@ -159,6 +168,12 @@ public class PermissionActivity extends Activity {
         final WindowManager.LayoutParams params = dialog.getWindow().getAttributes();
         params.width = getResources().getDimensionPixelSize(R.dimen.permission_dialog_width);
         dialog.getWindow().setAttributes(params);
+
+        // Hunt around to find the title of our newly created dialog so we can
+        // adjust accessibility focus once descriptions have been loaded
+        titleView = (TextView) findViewByPredicate(dialog.getWindow().getDecorView(), (view) -> {
+            return (view instanceof TextView) && view.isImportantForAccessibility();
+        });
     }
 
     private void onPositiveAction(DialogInterface dialog, int which) {
@@ -166,8 +181,8 @@ public class PermissionActivity extends Activity {
             @Override
             protected Void doInBackground(Void... params) {
                 Log.d(TAG, "User allowed grant for " + uris);
-                Metrics.logPermissionGranted(volumeName,
-                        System.currentTimeMillis(), getCallingPackage(), 1);
+                Metrics.logPermissionGranted(volumeName, appInfo.uid,
+                        getCallingPackage(), uris.size());
                 try {
                     switch (getIntent().getAction()) {
                         case MediaStore.CREATE_WRITE_REQUEST_CALL: {
@@ -184,6 +199,7 @@ public class PermissionActivity extends Activity {
                             for (Uri uri : uris) {
                                 ops.add(ContentProviderOperation.newUpdate(uri)
                                         .withValues(values)
+                                        .withExtra(MediaStore.QUERY_ARG_ALLOW_MOVEMENT, true)
                                         .withExceptionAllowed(true)
                                         .build());
                             }
@@ -220,8 +236,8 @@ public class PermissionActivity extends Activity {
             @Override
             protected Void doInBackground(Void... params) {
                 Log.d(TAG, "User declined request for " + uris);
-                Metrics.logPermissionDenied(volumeName,
-                        System.currentTimeMillis(), getCallingPackage(), 1);
+                Metrics.logPermissionDenied(volumeName, appInfo.uid, getCallingPackage(),
+                        1);
                 return null;
             }
 
@@ -246,18 +262,12 @@ public class PermissionActivity extends Activity {
     }
 
     /**
-     * Resolve a label that represents the remote calling app, typically the
-     * name of that app.
+     * Resolve a label that represents the app denoted by given {@link ApplicationInfo}.
      */
-    private @NonNull CharSequence resolveCallingLabel() throws NameNotFoundException {
-        final String callingPackage = getCallingPackage();
-        if (TextUtils.isEmpty(callingPackage)) {
-            throw new NameNotFoundException("Missing calling package");
-        }
-
+    private @NonNull CharSequence resolveAppLabel(final ApplicationInfo ai)
+            throws NameNotFoundException {
         final PackageManager pm = getPackageManager();
-        final CharSequence callingLabel = pm
-                .getApplicationLabel(pm.getApplicationInfo(callingPackage, 0));
+        final CharSequence callingLabel = pm.getApplicationLabel(ai);
         if (TextUtils.isEmpty(callingLabel)) {
             throw new NameNotFoundException("Missing calling package");
         }
@@ -265,15 +275,27 @@ public class PermissionActivity extends Activity {
         return callingLabel;
     }
 
+    /**
+     * Resolve the application info of the calling app.
+     */
+    private @NonNull ApplicationInfo resolveCallingAppInfo() throws NameNotFoundException {
+        final String callingPackage = getCallingPackage();
+        if (TextUtils.isEmpty(callingPackage)) {
+            throw new NameNotFoundException("Missing calling package");
+        }
+
+        return getPackageManager().getApplicationInfo(callingPackage, 0);
+    }
+
     private @NonNull String resolveVerb() {
         switch (getIntent().getAction()) {
             case MediaStore.CREATE_WRITE_REQUEST_CALL:
                 return VERB_WRITE;
             case MediaStore.CREATE_TRASH_REQUEST_CALL:
-                return (values.getAsInteger(MediaColumns.IS_TRASHED) != 0)
+                return getAsBoolean(values, MediaColumns.IS_TRASHED, false)
                         ? VERB_TRASH : VERB_UNTRASH;
             case MediaStore.CREATE_FAVORITE_REQUEST_CALL:
-                return (values.getAsInteger(MediaColumns.IS_FAVORITE) != 0)
+                return getAsBoolean(values, MediaColumns.IS_FAVORITE, false)
                         ? VERB_FAVORITE : VERB_UNFAVORITE;
             case MediaStore.CREATE_DELETE_REQUEST_CALL:
                 return VERB_DELETE;
@@ -361,6 +383,27 @@ public class PermissionActivity extends Activity {
     }
 
     /**
+     * Recursively walk the given view hierarchy looking for the first
+     * {@link View} which matches the given predicate.
+     */
+    private static @Nullable View findViewByPredicate(@NonNull View root,
+            @NonNull Predicate<View> predicate) {
+        if (predicate.test(root)) {
+            return root;
+        }
+        if (root instanceof ViewGroup) {
+            final ViewGroup group = (ViewGroup) root;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                final View res = findViewByPredicate(group.getChildAt(i), predicate);
+                if (res != null) {
+                    return res;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
      * Task that will load a set of {@link Description} to be eventually
      * displayed in the body of the dialog.
      */
@@ -423,6 +466,11 @@ public class PermissionActivity extends Activity {
             } else {
                 bindAsText(results);
             }
+
+            // This is pretty hacky, but somehow our dynamic loading of content
+            // can confuse accessibility focus, so refocus on the actual dialog
+            // title to announce ourselves properly
+            titleView.sendAccessibilityEvent(AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED);
         }
 
         /**

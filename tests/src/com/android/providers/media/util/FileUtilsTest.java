@@ -41,6 +41,7 @@ import static com.android.providers.media.util.FileUtils.extractDisplayName;
 import static com.android.providers.media.util.FileUtils.extractFileExtension;
 import static com.android.providers.media.util.FileUtils.extractFileName;
 import static com.android.providers.media.util.FileUtils.extractRelativePath;
+import static com.android.providers.media.util.FileUtils.extractTopLevelDir;
 import static com.android.providers.media.util.FileUtils.extractVolumeName;
 import static com.android.providers.media.util.FileUtils.extractVolumePath;
 import static com.android.providers.media.util.FileUtils.translateModeAccessToPosix;
@@ -51,6 +52,7 @@ import static com.android.providers.media.util.FileUtils.translateModeStringToPo
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -60,6 +62,9 @@ import android.provider.MediaStore.MediaColumns;
 
 import androidx.test.InstrumentationRegistry;
 import androidx.test.runner.AndroidJUnit4;
+
+import com.google.common.collect.Range;
+import com.google.common.truth.Truth;
 
 import org.junit.After;
 import org.junit.Before;
@@ -450,6 +455,21 @@ public class FileUtilsTest {
     }
 
     @Test
+    public void testExtractTopLevelDir() throws Exception {
+        for (String prefix : new String[] {
+                "/storage/emulated/0/",
+                "/storage/0000-0000/"
+        }) {
+            assertEquals(null,
+                    extractTopLevelDir(prefix + "foo.jpg"));
+            assertEquals("DCIM",
+                    extractTopLevelDir(prefix + "DCIM/foo.jpg"));
+            assertEquals("DCIM",
+                    extractTopLevelDir(prefix + "DCIM/My Vacation/foo.jpg"));
+        }
+    }
+
+    @Test
     public void testExtractDisplayName() throws Exception {
         for (String probe : new String[] {
                 "foo.bar.baz",
@@ -546,6 +566,63 @@ public class FileUtilsTest {
         values.put(MediaColumns.RELATIVE_PATH, "/");
         FileUtils.sanitizeValues(values);
         assertEquals("/", values.get(MediaColumns.RELATIVE_PATH));
+    }
+
+    @Test
+    public void testComputeDateExpires_None() throws Exception {
+        final ContentValues values = new ContentValues();
+        values.put(MediaColumns.DATE_EXPIRES, 1577836800L);
+
+        FileUtils.computeDateExpires(values);
+        assertFalse(values.containsKey(MediaColumns.DATE_EXPIRES));
+    }
+
+    @Test
+    public void testComputeDateExpires_Pending_Set() throws Exception {
+        final ContentValues values = new ContentValues();
+        values.put(MediaColumns.IS_PENDING, 1);
+        values.put(MediaColumns.DATE_EXPIRES, 1577836800L);
+
+        FileUtils.computeDateExpires(values);
+        final long target = (System.currentTimeMillis()
+                + FileUtils.DEFAULT_DURATION_PENDING) / 1_000;
+        Truth.assertThat(values.getAsLong(MediaColumns.DATE_EXPIRES))
+                .isIn(Range.closed(target - 5, target + 5));
+    }
+
+    @Test
+    public void testComputeDateExpires_Pending_Clear() throws Exception {
+        final ContentValues values = new ContentValues();
+        values.put(MediaColumns.IS_PENDING, 0);
+        values.put(MediaColumns.DATE_EXPIRES, 1577836800L);
+
+        FileUtils.computeDateExpires(values);
+        assertTrue(values.containsKey(MediaColumns.DATE_EXPIRES));
+        assertNull(values.get(MediaColumns.DATE_EXPIRES));
+    }
+
+    @Test
+    public void testComputeDateExpires_Trashed_Set() throws Exception {
+        final ContentValues values = new ContentValues();
+        values.put(MediaColumns.IS_TRASHED, 1);
+        values.put(MediaColumns.DATE_EXPIRES, 1577836800L);
+
+        FileUtils.computeDateExpires(values);
+        final long target = (System.currentTimeMillis()
+                + FileUtils.DEFAULT_DURATION_TRASHED) / 1_000;
+        Truth.assertThat(values.getAsLong(MediaColumns.DATE_EXPIRES))
+                .isIn(Range.closed(target - 5, target + 5));
+    }
+
+    @Test
+    public void testComputeDateExpires_Trashed_Clear() throws Exception {
+        final ContentValues values = new ContentValues();
+        values.put(MediaColumns.IS_TRASHED, 0);
+        values.put(MediaColumns.DATE_EXPIRES, 1577836800L);
+
+        FileUtils.computeDateExpires(values);
+        assertTrue(values.containsKey(MediaColumns.DATE_EXPIRES));
+        assertNull(values.get(MediaColumns.DATE_EXPIRES));
     }
 
     private static File touch(File dir, String name) throws IOException {
