@@ -702,13 +702,14 @@ public class FileUtils {
             }
 
             final String extFromMimeType;
-            if (ClipDescription.MIMETYPE_UNKNOWN.equals(mimeType)) {
+            if (ClipDescription.MIMETYPE_UNKNOWN.equalsIgnoreCase(mimeType)) {
                 extFromMimeType = null;
             } else {
                 extFromMimeType = MimeTypeMap.getSingleton().getExtensionFromMimeType(mimeType);
             }
 
-            if (Objects.equals(mimeType, mimeTypeFromExt) || Objects.equals(ext, extFromMimeType)) {
+            if (MimeUtils.equalIgnoreCase(mimeType, mimeTypeFromExt)
+                    || MimeUtils.equalIgnoreCase(ext, extFromMimeType)) {
                 // Extension maps back to requested MIME type; allow it
             } else {
                 // No match; insist that create file matches requested MIME
@@ -886,7 +887,7 @@ public class FileUtils {
             "(?i)^/storage/([^/]+)");
 
     private static @Nullable String normalizeUuid(@Nullable String fsUuid) {
-        return fsUuid != null ? fsUuid.toLowerCase(Locale.US) : null;
+        return fsUuid != null ? fsUuid.toLowerCase(Locale.ROOT) : null;
     }
 
     public static @Nullable String extractVolumePath(@Nullable String data) {
@@ -1092,15 +1093,18 @@ public class FileUtils {
         values.put(MediaColumns.DATA, filePath.getAbsolutePath());
     }
 
-    public static void sanitizeValues(@NonNull ContentValues values) {
+    public static void sanitizeValues(@NonNull ContentValues values,
+            boolean rewriteHiddenFileName) {
         final String[] relativePath = values.getAsString(MediaColumns.RELATIVE_PATH).split("/");
         for (int i = 0; i < relativePath.length; i++) {
-            relativePath[i] = sanitizeDisplayName(relativePath[i]);
+            relativePath[i] = sanitizeDisplayName(relativePath[i], rewriteHiddenFileName);
         }
         values.put(MediaColumns.RELATIVE_PATH,
                 String.join("/", relativePath) + "/");
+
+        final String displayName = values.getAsString(MediaColumns.DISPLAY_NAME);
         values.put(MediaColumns.DISPLAY_NAME,
-                sanitizeDisplayName(values.getAsString(MediaColumns.DISPLAY_NAME)));
+                sanitizeDisplayName(displayName, rewriteHiddenFileName));
     }
 
     /** {@hide} **/
@@ -1133,16 +1137,25 @@ public class FileUtils {
     }
 
     /**
-     * Sanitizes given name by appending '_' to make it non-hidden and mutating the file
-     * name to make it valid for a FAT filesystem.
+     * Sanitizes given name by mutating the file name to make it valid for a FAT filesystem.
      * @hide
      */
     public static @Nullable String sanitizeDisplayName(@Nullable String name) {
+        return sanitizeDisplayName(name, /*rewriteHiddenFileName*/ false);
+    }
+
+    /**
+     * Sanitizes given name by appending '_' to make it non-hidden and mutating the file name to
+     * make it valid for a FAT filesystem.
+     * @hide
+     */
+    public static @Nullable String sanitizeDisplayName(@Nullable String name,
+            boolean rewriteHiddenFileName) {
         if (name == null) {
             return null;
-        } else if (name.startsWith(".")) {
+        } else if (rewriteHiddenFileName && name.startsWith(".")) {
             // The resulting file must not be hidden.
-            return buildValidFatFilename("_" + name);
+            return "_" + name;
         } else {
             return buildValidFatFilename(name);
         }

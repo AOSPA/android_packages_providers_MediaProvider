@@ -135,7 +135,6 @@ public class FuseDaemonHostTest extends BaseHostJUnit4Test {
         runDeviceTest("testListFilesFromExternalMediaDirectory");
     }
 
-    @Ignore("Re-enable as part of b/145737191")
     @Test
     public void testListUnsupportedFileType() throws Exception {
         final ITestDevice device = getDevice();
@@ -237,25 +236,26 @@ public class FuseDaemonHostTest extends BaseHostJUnit4Test {
         runDeviceTest("testSystemGalleryAppHasNoFullAccessToAudio");
     }
 
-    @Ignore("Re-enable as part of b/145737191")
     @Test
     public void testSystemGalleryCanRenameImagesAndVideos() throws Exception {
         runDeviceTest("testSystemGalleryCanRenameImagesAndVideos");
     }
 
-    @Ignore("Re-enable as part of b/145737191")
     @Test
     public void testManageExternalStorageCanCreateFilesAnywhere() throws Exception {
         runDeviceTest("testManageExternalStorageCanCreateFilesAnywhere");
     }
 
-    @Ignore("Re-enable as part of b/145737191")
     @Test
     public void testManageExternalStorageCanDeleteOtherAppsContents() throws Exception {
         runDeviceTest("testManageExternalStorageCanDeleteOtherAppsContents");
     }
 
-    @Ignore("Re-enable as part of b/145737191")
+    @Test
+    public void testManageExternalStorageReaddir() throws Exception {
+        runDeviceTest("testManageExternalStorageReaddir");
+    }
+
     @Test
     public void testManageExternalStorageCanRenameOtherAppsContents() throws Exception {
         runDeviceTest("testManageExternalStorageCanRenameOtherAppsContents");
@@ -269,6 +269,27 @@ public class FuseDaemonHostTest extends BaseHostJUnit4Test {
     @Test
     public void testCanCreateHiddenFile() throws Exception {
         runDeviceTest("testCanCreateHiddenFile");
+    }
+
+    @Test
+    public void testCanRenameHiddenFile() throws Exception {
+        runDeviceTest("testCanRenameHiddenFile");
+
+    }
+
+    @Test
+    public void testHiddenDirectory() throws Exception {
+        runDeviceTest("testHiddenDirectory");
+    }
+
+    @Test
+    public void testHiddenDirectory_nomedia() throws Exception {
+        runDeviceTest("testHiddenDirectory_nomedia");
+    }
+
+    @Test
+    public void testListHiddenFile() throws Exception {
+        runDeviceTest("testListHiddenFile");
     }
 
     @Test
@@ -304,6 +325,11 @@ public class FuseDaemonHostTest extends BaseHostJUnit4Test {
     @Test
     public void testRenameCanRestoreDeletedRowId() throws Exception {
         runDeviceTest("testRenameCanRestoreDeletedRowId");
+    }
+
+    @Test
+    public void testCantCreateOrRenameFileWithInvalidName() throws Exception {
+        runDeviceTest("testCantCreateOrRenameFileWithInvalidName");
     }
 
     @Test
