@@ -686,7 +686,7 @@ public class FileUtils {
 
             // Extract requested extension from display name
             final int lastDot = displayName.lastIndexOf('.');
-            if (lastDot >= 0) {
+            if (lastDot > 0) {
                 name = displayName.substring(0, lastDot);
                 ext = displayName.substring(lastDot + 1);
                 mimeTypeFromExt = MimeTypeMap.getSingleton().getMimeTypeFromExtension(
@@ -1171,5 +1171,39 @@ public class FileUtils {
         } else {
             return buildValidFatFilename(name);
         }
+    }
+
+    /**
+     * Clears all app's external cache directories, i.e. for each app we delete
+     * /sdcard/Android/data/app/cache/* but we keep the directory itself.
+     *
+     * @return 0 in case of success, or {@link OsConstants#EIO} if any error occurs.
+     *
+     * <p>This method doesn't perform any checks, so make sure that the calling package is allowed
+     * to clear cache directories first.
+     *
+     * <p>If this method returned {@link OsConstants#EIO}, then we can't guarantee whether all, none
+     * or part of the directories were cleared.
+     */
+    public static int clearAppCacheDirectories() {
+        int status = 0;
+        Log.i(TAG, "Clearing cache for all apps");
+        final File rootDataDir = buildPath(Environment.getExternalStorageDirectory(),
+                "Android", "data");
+        for (File appDataDir : rootDataDir.listFiles()) {
+            try {
+                final File appCacheDir = new File(appDataDir, "cache");
+                if (appCacheDir.isDirectory()) {
+                    FileUtils.deleteContents(appCacheDir);
+                }
+            } catch (Exception e) {
+                // We want to avoid crashing MediaProvider at all costs, so we handle all "generic"
+                // exceptions here, and just report to the caller that an IO exception has occurred.
+                // We still try to clear the rest of the directories.
+                Log.e(TAG, "Couldn't delete all app cache dirs!", e);
+                status = OsConstants.EIO;
+            }
+        }
+        return status;
     }
 }

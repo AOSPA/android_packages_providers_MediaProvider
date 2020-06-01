@@ -67,12 +67,14 @@ public class SQLiteQueryBuilder {
             "(?i)(AVG|COUNT|MAX|MIN|SUM|TOTAL|GROUP_CONCAT|UNICODE)\\((.+)\\)");
 
     /**
-     * Narrow concession to support legacy apps that aren't using proper SQL
-     * string substitution; these values come from the raw query in b/154193772.
+     * Narrow concessions to support legacy apps that aren't using proper SQL
+     * string substitution; these values come from specific bugs.
      */
-    private static final Pattern sExtensionPattern = Pattern.compile(
-            "%.(wmv|wm|wtv|asf|hls|mp4|m4v|mov|mp4v|3g2|3gp|3gp2|3gpp|mj2|qt|external|"
+    private static final Pattern sPattern154193772 = Pattern.compile(
+            "(?i)%\\.(wmv|wm|wtv|asf|hls|mp4|m4v|mov|mp4v|3g2|3gp|3gp2|3gpp|mj2|qt|external|"
                     + "mov|asf|avi|divx|mpg|mpeg|mkv|webm|mk3d|mks|3gp|mpegts|ts|m2ts|m2t)");
+    private static final Pattern sPattern156832140 = Pattern.compile(
+            "(?i)%com\\.gopro\\.smarty%");
 
     private Map<String, String> mProjectionMap = null;
     private Collection<Pattern> mProjectionGreylist = null;
@@ -213,7 +215,14 @@ public class SQLiteQueryBuilder {
      * @param columnMap maps from the user column names to the database column names
      */
     public void setProjectionMap(@Nullable Map<String, String> columnMap) {
-        mProjectionMap = columnMap;
+        if (columnMap != null) {
+            mProjectionMap = new ArrayMap<String, String>();
+            for (Entry<String, String> entry : columnMap.entrySet()) {
+                mProjectionMap.put(entry.getKey().toLowerCase(Locale.ROOT), entry.getValue());
+            }
+        } else {
+            mProjectionMap = null;
+        }
     }
 
     /**
@@ -800,9 +809,10 @@ public class SQLiteQueryBuilder {
         if (isAllowedKeyword) return;
 
         if (mTargetSdkVersion < Build.VERSION_CODES.R) {
-            // Narrow concession to support legacy apps that aren't using proper
-            // SQL string substitution
-            if (sExtensionPattern.matcher(token).matches()) return;
+            // Narrow concessions to support legacy apps that aren't using
+            // proper SQL string substitution
+            if (sPattern154193772.matcher(token).matches()) return;
+            if (sPattern156832140.matcher(token).matches()) return;
         }
 
         throw new IllegalArgumentException("Invalid token " + token);
@@ -1021,7 +1031,7 @@ public class SQLiteQueryBuilder {
         }
 
         String operator = null;
-        String column = mProjectionMap.get(userColumn);
+        String column = mProjectionMap.get(userColumn.toLowerCase(Locale.ROOT));
 
         // When no direct match found, look for aggregation
         if (column == null) {
@@ -1029,7 +1039,7 @@ public class SQLiteQueryBuilder {
             if (matcher.matches()) {
                 operator = matcher.group(1);
                 userColumn = matcher.group(2);
-                column = mProjectionMap.get(userColumn);
+                column = mProjectionMap.get(userColumn.toLowerCase(Locale.ROOT));
             }
         }
 
