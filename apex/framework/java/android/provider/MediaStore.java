@@ -160,6 +160,9 @@ public final class MediaStore {
     public static final String VOLUME_EXTERNAL_PRIMARY = "external_primary";
 
     /** {@hide} */
+    public static final String VOLUME_DEMO = "demo";
+
+    /** {@hide} */
     public static final String RESOLVE_PLAYLIST_MEMBERS_CALL = "resolve_playlist_members";
     /** {@hide} */
     public static final String RUN_IDLE_MAINTENANCE_CALL = "run_idle_maintenance";
@@ -2597,7 +2600,7 @@ public final class MediaStore {
          */
         @Deprecated
         public static @Nullable String keyFor(@Nullable String name) {
-            if (TextUtils.isEmpty(name)) return null;
+            if (TextUtils.isEmpty(name)) return "";
 
             if (UNKNOWN_STRING.equals(name)) {
                 return "01";
@@ -2606,7 +2609,7 @@ public final class MediaStore {
             final boolean sortFirst = name.startsWith("\001");
 
             name = PATTERN_TRIM_BEFORE.matcher(name).replaceAll("");
-            if (TextUtils.isEmpty(name)) return null;
+            if (TextUtils.isEmpty(name)) return "";
 
             final Collator c = Collator.getInstance(Locale.ROOT);
             c.setStrength(Collator.PRIMARY);
@@ -3727,6 +3730,8 @@ public final class MediaStore {
         } else if (VOLUME_EXTERNAL.equals(volumeName)) {
             return volumeName;
         } else if (VOLUME_EXTERNAL_PRIMARY.equals(volumeName)) {
+            return volumeName;
+        } else if (VOLUME_DEMO.equals(volumeName)) {
             return volumeName;
         }
 
