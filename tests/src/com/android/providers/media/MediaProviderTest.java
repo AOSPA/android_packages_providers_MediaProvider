@@ -61,6 +61,7 @@ import com.android.providers.media.util.FileUtils;
 import com.android.providers.media.util.SQLiteQueryBuilder;
 
 import org.junit.AfterClass;
+import org.junit.Assume;
 import org.junit.BeforeClass;
 import org.junit.Ignore;
 import org.junit.Test;
@@ -96,7 +97,7 @@ public class MediaProviderTest {
                         Manifest.permission.READ_COMPAT_CHANGE_CONFIG);
 
         final Context context = InstrumentationRegistry.getTargetContext();
-        sIsolatedContext = new IsolatedContext(context, "modern");
+        sIsolatedContext = new IsolatedContext(context, "modern", /*asFuseThread*/ false);
         sIsolatedResolver = sIsolatedContext.getContentResolver();
     }
 
@@ -104,6 +105,19 @@ public class MediaProviderTest {
     public static void tearDown() {
         InstrumentationRegistry.getInstrumentation()
                 .getUiAutomation().dropShellPermissionIdentity();
+    }
+
+    /**
+     * To fully exercise all our tests, we require that the Cuttlefish emulator
+     * have both emulated primary storage and an SD card be present.
+     */
+    @Test
+    public void testCuttlefish() {
+        Assume.assumeTrue(Build.MODEL.contains("Cuttlefish"));
+
+        assertTrue("Cuttlefish must have both emulated storage and an SD card to exercise tests",
+                MediaStore.getExternalVolumeNames(InstrumentationRegistry.getTargetContext())
+                        .size() > 1);
     }
 
     @Test
@@ -228,7 +242,7 @@ public class MediaProviderTest {
     public void testCanonicalize() throws Exception {
         // We might have old files lurking, so force a clean slate
         final Context context = InstrumentationRegistry.getTargetContext();
-        sIsolatedContext = new IsolatedContext(context, "modern");
+        sIsolatedContext = new IsolatedContext(context, "modern", /*asFuseThread*/ false);
         sIsolatedResolver = sIsolatedContext.getContentResolver();
 
         final File dir = Environment
@@ -905,7 +919,7 @@ public class MediaProviderTest {
     private static ContentValues computeDataValues(String path) {
         final ContentValues values = new ContentValues();
         values.put(MediaColumns.DATA, path);
-        FileUtils.computeValuesFromData(values);
+        FileUtils.computeValuesFromData(values, /*forFuse*/ false);
         Log.v(TAG, "Computed values " + values);
         return values;
     }
@@ -953,14 +967,14 @@ public class MediaProviderTest {
         values.put(MediaColumns.MIME_TYPE, mimeType);
         try {
             ensureFileColumns(uri, values);
-        } catch (VolumeArgumentException e) {
+        } catch (VolumeArgumentException | VolumeNotFoundException e) {
             throw e.rethrowAsIllegalArgumentException();
         }
         return values.getAsString(MediaColumns.DATA);
     }
 
     private void ensureFileColumns(Uri uri, ContentValues values)
-            throws VolumeArgumentException {
+            throws VolumeArgumentException, VolumeNotFoundException {
         try (ContentProviderClient cpc = sIsolatedResolver
                 .acquireContentProviderClient(MediaStore.AUTHORITY)) {
             ((MediaProvider) cpc.getLocalContentProvider())

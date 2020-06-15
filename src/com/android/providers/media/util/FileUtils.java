@@ -686,7 +686,7 @@ public class FileUtils {
 
             // Extract requested extension from display name
             final int lastDot = displayName.lastIndexOf('.');
-            if (lastDot >= 0) {
+            if (lastDot > 0) {
                 name = displayName.substring(0, lastDot);
                 ext = displayName.substring(lastDot + 1);
                 mimeTypeFromExt = MimeTypeMap.getSingleton().getMimeTypeFromExtension(
@@ -807,8 +807,25 @@ public class FileUtils {
         }
 
         final Uri uri = MediaStore.Files.getContentUri(volumeName);
-        return context.getSystemService(StorageManager.class).getStorageVolume(uri)
+        final File path = context.getSystemService(StorageManager.class).getStorageVolume(uri)
                 .getDirectory();
+        if (path != null) {
+            return path;
+        } else {
+            throw new FileNotFoundException(volumeName + " has no associated path");
+        }
+    }
+
+    /**
+     * Returns the content URI for the volume that contains the given path.
+     *
+     * <p>{@link MediaStore.Files#getContentUriForPath(String)} can't detect public volumes and can
+     * only return the URI for the primary external storage, that's why this utility should be used
+     * instead.
+     */
+    public static @NonNull Uri getContentUriForPath(@NonNull String path) {
+        Objects.requireNonNull(path);
+        return MediaStore.Files.getContentUri(extractVolumeName(path));
     }
 
     /**
@@ -828,7 +845,9 @@ public class FileUtils {
     public static final Pattern PATTERN_DOWNLOADS_DIRECTORY = Pattern.compile(
             "(?i)^/storage/[^/]+/(?:[0-9]+/)?(?:Android/sandbox/[^/]+/)?Download/?");
     public static final Pattern PATTERN_EXPIRES_FILE = Pattern.compile(
-            "(?i)^\\.(pending|trashed)-(\\d+)-(.+)$");
+            "(?i)^\\.(pending|trashed)-(\\d+)-([^/]+)$");
+    public static final Pattern PATTERN_PENDING_FILEPATH_FOR_SQL = Pattern.compile(
+            ".*/\\.pending-(\\d+)-([^/]+)$");
 
     /**
      * File prefix indicating that the file {@link MediaColumns#IS_PENDING}.
@@ -1017,11 +1036,10 @@ public class FileUtils {
      * {@link MediaColumns#DATA}. This method performs no enforcement of
      * argument validity.
      */
-    public static void computeValuesFromData(@NonNull ContentValues values) {
+    public static void computeValuesFromData(@NonNull ContentValues values, boolean isForFuse) {
         // Worst case we have to assume no bucket details
         values.remove(MediaColumns.VOLUME_NAME);
         values.remove(MediaColumns.RELATIVE_PATH);
-        values.remove(MediaColumns.IS_PENDING);
         values.remove(MediaColumns.IS_TRASHED);
         values.remove(MediaColumns.DATE_EXPIRES);
         values.remove(MediaColumns.DISPLAY_NAME);
@@ -1046,7 +1064,14 @@ public class FileUtils {
             values.put(MediaColumns.DATE_EXPIRES, Long.parseLong(matcher.group(2)));
             values.put(MediaColumns.DISPLAY_NAME, matcher.group(3));
         } else {
-            values.put(MediaColumns.IS_PENDING, 0);
+            if (isForFuse) {
+                // Allow Fuse thread to set IS_PENDING when using DATA column.
+                // TODO(b/156867379) Unset IS_PENDING when Fuse thread doesn't explicitly specify
+                // IS_PENDING. It can't be done now because we scan after create. Scan doesn't
+                // explicitly specify the value of IS_PENDING.
+            } else {
+                values.put(MediaColumns.IS_PENDING, 0);
+            }
             values.put(MediaColumns.IS_TRASHED, 0);
             values.putNull(MediaColumns.DATE_EXPIRES);
             values.put(MediaColumns.DISPLAY_NAME, displayName);
@@ -1069,12 +1094,13 @@ public class FileUtils {
      * argument validity.
      */
     public static void computeDataFromValues(@NonNull ContentValues values,
-            @NonNull File volumePath) {
+            @NonNull File volumePath, boolean isForFuse) {
         values.remove(MediaColumns.DATA);
 
         final String displayName = values.getAsString(MediaColumns.DISPLAY_NAME);
         final String resolvedDisplayName;
-        if (getAsBoolean(values, MediaColumns.IS_PENDING, false)) {
+        // Pending file path shouldn't be rewritten for files inserted via filepath.
+        if (!isForFuse && getAsBoolean(values, MediaColumns.IS_PENDING, false)) {
             final long dateExpires = getAsLong(values, MediaColumns.DATE_EXPIRES,
                     (System.currentTimeMillis() + DEFAULT_DURATION_PENDING) / 1000);
             resolvedDisplayName = String.format(".%s-%d-%s",
@@ -1159,5 +1185,39 @@ public class FileUtils {
         } else {
             return buildValidFatFilename(name);
         }
+    }
+
+    /**
+     * Clears all app's external cache directories, i.e. for each app we delete
+     * /sdcard/Android/data/app/cache/* but we keep the directory itself.
+     *
+     * @return 0 in case of success, or {@link OsConstants#EIO} if any error occurs.
+     *
+     * <p>This method doesn't perform any checks, so make sure that the calling package is allowed
+     * to clear cache directories first.
+     *
+     * <p>If this method returned {@link OsConstants#EIO}, then we can't guarantee whether all, none
+     * or part of the directories were cleared.
+     */
+    public static int clearAppCacheDirectories() {
+        int status = 0;
+        Log.i(TAG, "Clearing cache for all apps");
+        final File rootDataDir = buildPath(Environment.getExternalStorageDirectory(),
+                "Android", "data");
+        for (File appDataDir : rootDataDir.listFiles()) {
+            try {
+                final File appCacheDir = new File(appDataDir, "cache");
+                if (appCacheDir.isDirectory()) {
+                    FileUtils.deleteContents(appCacheDir);
+                }
+            } catch (Exception e) {
+                // We want to avoid crashing MediaProvider at all costs, so we handle all "generic"
+                // exceptions here, and just report to the caller that an IO exception has occurred.
+                // We still try to clear the rest of the directories.
+                Log.e(TAG, "Couldn't delete all app cache dirs!", e);
+                status = OsConstants.EIO;
+            }
+        }
+        return status;
     }
 }

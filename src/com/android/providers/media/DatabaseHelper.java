@@ -47,6 +47,7 @@ import android.provider.MediaStore.Video;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.system.OsConstants;
+import android.text.format.DateUtils;
 import android.util.ArrayMap;
 import android.util.ArraySet;
 import android.util.Log;
@@ -66,6 +67,7 @@ import com.android.providers.media.util.MimeUtils;
 
 import java.io.File;
 import java.io.FilenameFilter;
+import java.io.IOException;
 import java.lang.annotation.Annotation;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
@@ -823,7 +825,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                     // then overwrite with other migrated columns
                     final String data = c.getString(c.getColumnIndex(MediaColumns.DATA));
                     values.put(MediaColumns.DATA, data);
-                    FileUtils.computeValuesFromData(values);
+                    FileUtils.computeValuesFromData(values, /*isForFuse*/ false);
                     for (String column : sMigrateColumns) {
                         DatabaseUtils.copyFromCursorToContentValues(column, c, values);
                     }
@@ -832,16 +834,17 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                     // rename them on disk to match new schema
                     final String volumePath = FileUtils.extractVolumePath(data);
                     if (volumePath != null) {
-                        FileUtils.computeDataFromValues(values, new File(volumePath));
+                        FileUtils.computeDataFromValues(values, new File(volumePath),
+                                /*isForFuse*/ false);
                         final String recomputedData = values.getAsString(MediaColumns.DATA);
                         if (!Objects.equals(data, recomputedData)) {
                             try {
-                                Os.rename(data, recomputedData);
-                            } catch (ErrnoException e) {
+                                renameWithRetry(data, recomputedData);
+                            } catch (IOException e) {
                                 // We only have one shot to migrate data, so log and
                                 // keep marching forward
-                                Log.w(TAG, "Failed to rename " + values + "; continuing");
-                                FileUtils.computeValuesFromData(values);
+                                Log.wtf(TAG, "Failed to rename " + values + "; continuing", e);
+                                FileUtils.computeValuesFromData(values, /*isForFuse*/ false);
                             }
                         }
                     }
@@ -1274,7 +1277,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 final long id = c.getLong(0);
                 final String data = c.getString(1);
                 values.put(FileColumns.DATA, data);
-                FileUtils.computeValuesFromData(values);
+                FileUtils.computeValuesFromData(values, /*isForFuse*/ false);
                 values.remove(FileColumns.DATA);
                 if (!values.isEmpty()) {
                     db.update("files", values, "_id=" + id, null);
@@ -1522,6 +1525,33 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
             } else {
                 throw new RuntimeException(e);
             }
+        }
+    }
+
+    private static final long RENAME_TIMEOUT = 10 * DateUtils.SECOND_IN_MILLIS;
+
+    /**
+     * When renaming files during migration, the underlying pass-through view of
+     * storage may not be mounted yet, so we're willing to retry several times
+     * before giving up.
+     */
+    private static void renameWithRetry(@NonNull String oldPath, @NonNull String newPath)
+            throws IOException {
+        final long start = SystemClock.elapsedRealtime();
+        while (true) {
+            if (SystemClock.elapsedRealtime() - start > RENAME_TIMEOUT) {
+                throw new IOException("Passthrough failed to mount");
+            }
+
+            try {
+                Os.rename(oldPath, newPath);
+                return;
+            } catch (ErrnoException e) {
+                Log.i(TAG, "Failed to rename: " + e);
+            }
+
+            Log.i(TAG, "Waiting for passthrough to be mounted...");
+            SystemClock.sleep(100);
         }
     }
 

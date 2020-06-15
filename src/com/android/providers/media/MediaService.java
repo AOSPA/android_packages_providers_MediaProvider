@@ -110,10 +110,10 @@ public class MediaService extends JobIntentService {
 
     public static void onScanVolume(Context context, String volumeName, int reason)
             throws IOException {
-        // If we're about to scan primary external storage, scan internal first
+        // If we're about to scan any external storage, scan internal first
         // to ensure that we have ringtones ready to roll before a possibly very
         // long external storage scan
-        if (MediaStore.VOLUME_EXTERNAL_PRIMARY.equals(volumeName)) {
+        if (!MediaStore.VOLUME_INTERNAL.equals(volumeName)) {
             onScanVolume(context, MediaStore.VOLUME_INTERNAL, reason);
             RingtoneManager.ensureDefaultRingtones(context);
         }
@@ -131,7 +131,7 @@ public class MediaService extends JobIntentService {
         try (ContentProviderClient cpc = context.getContentResolver()
                 .acquireContentProviderClient(MediaStore.AUTHORITY)) {
             final MediaProvider provider = ((MediaProvider) cpc.getLocalContentProvider());
-            provider.attachVolume(volumeName);
+            provider.attachVolume(volumeName, /* validate */ true);
 
             final ContentResolver resolver = ContentResolver.wrap(cpc.getLocalContentProvider());
 

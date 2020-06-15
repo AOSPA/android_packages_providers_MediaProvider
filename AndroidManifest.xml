@@ -19,7 +19,7 @@
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.USE_RESERVED_DISK" />
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
-    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.HIDE_NON_SYSTEM_OVERLAY_WINDOWS" />
 
     <!-- Permissions required for reading and logging compat changes -->
     <uses-permission android:name="android.permission.LOG_COMPAT_CHANGE"/>
@@ -102,12 +102,14 @@
 
         <activity
                 android:name="com.android.providers.media.PermissionActivity"
+                android:configChanges="orientation|keyboardHidden|screenSize"
                 android:theme="@style/PickerDialogTheme"
                 android:exported="false"
                 android:excludeFromRecents="true" />
 
         <activity
                 android:name="com.android.providers.media.CacheClearingActivity"
+                android:configChanges="orientation|keyboardHidden|screenSize"
                 android:exported="true"
                 android:theme="@style/CacheClearingAlertDialogTheme"
                 android:finishOnCloseSystemDialogs="true"
