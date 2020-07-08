@@ -36,13 +36,14 @@ import static android.provider.MediaStore.getVolumeName;
 
 import static com.android.providers.media.DatabaseHelper.EXTERNAL_DATABASE_NAME;
 import static com.android.providers.media.DatabaseHelper.INTERNAL_DATABASE_NAME;
-import static com.android.providers.media.LocalCallingIdentity.PERMISSION_IS_BACKUP;
+import static com.android.providers.media.LocalCallingIdentity.PERMISSION_IS_DELEGATOR;
 import static com.android.providers.media.LocalCallingIdentity.PERMISSION_IS_LEGACY_GRANTED;
 import static com.android.providers.media.LocalCallingIdentity.PERMISSION_IS_LEGACY_READ;
 import static com.android.providers.media.LocalCallingIdentity.PERMISSION_IS_LEGACY_WRITE;
+import static com.android.providers.media.LocalCallingIdentity.PERMISSION_IS_MANAGER;
 import static com.android.providers.media.LocalCallingIdentity.PERMISSION_IS_REDACTION_NEEDED;
-import static com.android.providers.media.LocalCallingIdentity.PERMISSION_IS_SYSTEM;
-import static com.android.providers.media.LocalCallingIdentity.PERMISSION_MANAGE_EXTERNAL_STORAGE;
+import static com.android.providers.media.LocalCallingIdentity.PERMISSION_IS_SELF;
+import static com.android.providers.media.LocalCallingIdentity.PERMISSION_IS_SHELL;
 import static com.android.providers.media.LocalCallingIdentity.PERMISSION_READ_AUDIO;
 import static com.android.providers.media.LocalCallingIdentity.PERMISSION_READ_IMAGES;
 import static com.android.providers.media.LocalCallingIdentity.PERMISSION_READ_VIDEO;
@@ -66,7 +67,6 @@ import static com.android.providers.media.util.FileUtils.isDownload;
 import static com.android.providers.media.util.FileUtils.sanitizePath;
 import static com.android.providers.media.util.Logging.LOGV;
 import static com.android.providers.media.util.Logging.TAG;
-import static com.android.providers.media.util.PermissionUtils.checkPermissionManageExternalStorage;
 
 import android.app.AppOpsManager;
 import android.app.AppOpsManager.OnOpActiveChangedListener;
@@ -126,8 +126,8 @@ import android.os.SystemClock;
 import android.os.SystemProperties;
 import android.os.Trace;
 import android.os.UserHandle;
-import android.os.storage.StorageManager.StorageVolumeCallback;
 import android.os.storage.StorageManager;
+import android.os.storage.StorageManager.StorageVolumeCallback;
 import android.os.storage.StorageVolume;
 import android.preference.PreferenceManager;
 import android.provider.BaseColumns;
@@ -156,6 +156,7 @@ import android.util.Log;
 import android.util.LongSparseArray;
 import android.util.Size;
 import android.util.SparseArray;
+import android.webkit.MimeTypeMap;
 
 import androidx.annotation.GuardedBy;
 import androidx.annotation.Keep;
@@ -276,6 +277,13 @@ public class MediaProvider extends ContentProvider {
      * match no additional write permission checks are carried out for those items.
      */
     private static final int MATCH_VISIBLE_FOR_FILEPATH = 32;
+
+    /**
+     * Where clause to match pending files from FUSE. Pending files from FUSE will not have
+     * PATTERN_PENDING_FILEPATH_FOR_SQL pattern.
+     */
+    private static final String MATCH_PENDING_FROM_FUSE = String.format("lower(%s) NOT REGEXP '%s'",
+            MediaColumns.DATA, PATTERN_PENDING_FILEPATH_FOR_SQL);
 
     /**
      * Set of {@link Cursor} columns that refer to raw filesystem paths.
@@ -534,21 +542,31 @@ public class MediaProvider extends ContentProvider {
 
     private final void updateQuotaTypeForUri(@NonNull Uri uri, int mediaType) {
         Trace.beginSection("updateQuotaTypeForUri");
+        File file;
         try {
-            updateQuotaTypeForUriInternal(uri, mediaType);
+            file = queryForDataFile(uri, null);
+            if (!file.exists()) {
+                // This can happen if an item is inserted in MediaStore before it is created
+                return;
+            }
+
+            if (mediaType == FileColumns.MEDIA_TYPE_NONE) {
+                // This might be because the file is hidden; but we still want to
+                // attribute its quota to the correct type, so get the type from
+                // the extension instead.
+                mediaType = MimeUtils.resolveMediaType(MimeUtils.resolveMimeType(file));
+            }
+
+            updateQuotaTypeForFileInternal(file, mediaType);
+        } catch (FileNotFoundException e) {
+            // Ignore
+            return;
         } finally {
             Trace.endSection();
         }
     }
 
-    private final void updateQuotaTypeForUriInternal(@NonNull Uri uri, int mediaType) {
-        File file;
-        try {
-            file = queryForDataFile(uri, null);
-        } catch (FileNotFoundException e) {
-            // Ignore
-            return;
-        }
+    private final void updateQuotaTypeForFileInternal(File file, int mediaType) {
         try {
             switch (mediaType) {
                 case FileColumns.MEDIA_TYPE_AUDIO:
@@ -604,21 +622,23 @@ public class MediaProvider extends ContentProvider {
                 long newId, int newMediaType, boolean newIsDownload,
                 String oldOwnerPackage, String newOwnerPackage, String oldPath) {
             final boolean isDownload = oldIsDownload || newIsDownload;
+            final Uri fileUri = MediaStore.Files.getContentUri(volumeName, oldId);
             handleUpdatedRowForFuse(oldPath, oldOwnerPackage, oldId, newId);
             handleOwnerPackageNameChange(oldPath, oldOwnerPackage, newOwnerPackage);
             acceptWithExpansion(helper::notifyUpdate, volumeName, oldId, oldMediaType, isDownload);
+
+            helper.postBackground(() -> {
+                if (helper.isExternal()) {
+                    // Update the quota type on the filesystem
+                    updateQuotaTypeForUri(fileUri, newMediaType);
+                }
+            });
 
             if (newMediaType != oldMediaType) {
                 acceptWithExpansion(helper::notifyUpdate, volumeName, oldId, newMediaType,
                         isDownload);
 
                 helper.postBackground(() -> {
-                    final Uri fileUri = MediaStore.Files.getContentUri(volumeName, oldId);
-                    if (helper.isExternal()) {
-                        // Update the quota type on the filesystem
-                        updateQuotaTypeForUri(fileUri, newMediaType);
-                    }
-
                     // Invalidate any thumbnails when the media type changes
                     invalidateThumbnails(fileUri);
                 });
@@ -909,6 +929,17 @@ public class MediaProvider extends ContentProvider {
                 null /* all packages */, mModeListener);
         mAppOpsManager.startWatchingMode(AppOpsManager.OPSTR_WRITE_MEDIA_VIDEO,
                 null /* all packages */, mModeListener);
+        try {
+            // Here we are forced to depend on the non-public API of AppOpsManager. If
+            // OPSTR_NO_ISOLATED_STORAGE app op is not defined in AppOpsManager, then this call will
+            // throw an IllegalArgumentException during MediaProvider startup. In combination with
+            // MediaProvider's CTS tests it should give us guarantees that OPSTR_NO_ISOLATED_STORAGE
+            // is defined.
+            mAppOpsManager.startWatchingMode(PermissionUtils.OPSTR_NO_ISOLATED_STORAGE,
+                    null /* all packages */, mModeListener);
+        } catch (IllegalArgumentException e) {
+            Log.w(TAG, "Failed to start watching " + PermissionUtils.OPSTR_NO_ISOLATED_STORAGE, e);
+        }
         return true;
     }
 
@@ -1100,14 +1131,31 @@ public class MediaProvider extends ContentProvider {
     }
 
     /**
+     * Called when a new file is created through FUSE
+     *
+     * @param file path of the file that was created
+     *
+     * Called from JNI in jni/MediaProviderWrapper.cpp
+     */
+    @Keep
+    public void onFileCreatedForFuse(String path) {
+        // Make sure we update the quota type of the file
+        BackgroundThread.getExecutor().execute(() -> {
+            File file = new File(path);
+            int mediaType = MimeUtils.resolveMediaType(MimeUtils.resolveMimeType(file));
+            updateQuotaTypeForFileInternal(file, mediaType);
+        });
+    }
+
+    /**
      * Returns true if the app denoted by the given {@code uid} and {@code packageName} is allowed
      * to clear other apps' cache directories.
      */
     static boolean hasPermissionToClearCaches(Context context, ApplicationInfo ai) {
         PermissionUtils.setOpDescription("clear app cache");
         try {
-            return checkPermissionManageExternalStorage(context, /*pid*/ -1, ai.uid, ai.packageName,
-                    /*attributionTag*/ null);
+            return PermissionUtils.checkPermissionManager(context, /* pid */ -1, ai.uid,
+                    ai.packageName, /* attributionTag */ null);
         } finally {
             PermissionUtils.clearOpDescription();
         }
@@ -1285,6 +1333,26 @@ public class MediaProvider extends ContentProvider {
     }
 
     /**
+     * @return where clause to exclude database rows where
+     * <ul>
+     * <li> {@code column} is set or
+     * <li> {@code column} is {@link MediaColumns#IS_PENDING} and is set by FUSE and not owned by
+     * calling package.
+     * </ul>
+     */
+    private String getWhereClauseForMatchExclude(@NonNull String column) {
+        if (column.equalsIgnoreCase(MediaColumns.IS_PENDING)) {
+            final String callingPackage = getCallingPackageOrSelf();
+            final String matchSharedPackagesClause = FileColumns.OWNER_PACKAGE_NAME + " IN "
+                    + getSharedPackages();
+            // Include owned pending files from Fuse
+            return String.format("%s=0 OR (%s=1 AND %s AND %s)", column, column,
+                    MATCH_PENDING_FROM_FUSE, matchSharedPackagesClause);
+        }
+        return column + "=0";
+    }
+
+    /**
      * @return where clause to include database rows where
      * <ul>
      * <li> {@code column} is not set or
@@ -1366,14 +1434,12 @@ public class MediaProvider extends ContentProvider {
         }
 
         final String matchSharedPackagesClause = FileColumns.OWNER_PACKAGE_NAME + " IN "
-                + getSharedPackages(callingPackage);
+                + getSharedPackages();
         options.add(DatabaseUtils.bindSelection(matchSharedPackagesClause));
 
         if (column.equalsIgnoreCase(MediaColumns.IS_PENDING)) {
             // Include all pending files from Fuse
-            final String matchPendingFromFuse = String.format("lower(%s) NOT REGEXP '%s'",
-                    MediaColumns.DATA, PATTERN_PENDING_FILEPATH_FOR_SQL);
-            options.add(matchPendingFromFuse);
+            options.add(MATCH_PENDING_FROM_FUSE);
         }
 
         final String matchWritableRowsClause = String.format("%s=0 OR (%s=1 AND %s)", column,
@@ -1461,37 +1527,19 @@ public class MediaProvider extends ContentProvider {
     }
 
     /**
-     * Scan files during renames for the following reasons:
+     * Scan files during directory renames for the following reasons:
      * <ul>
-     * <li>When a file or directory is renamed, media type for the corresponding db row will be
-     * updated with media type resolved based on the mime type of the file. This updated media type
-     * doesn't consider hidden file/hidden directory, so we must scan the new path to update the
-     * media type based on the path of the file.
-     * <li>When a file is renamed to .nomedia, the new parent will be a hidden directory. We should
-     * scan new parent directory to ensure all files in that directory are updated with
-     * MEDIA_TYPE_NONE.
-     * <li>When a .nomedia file is moved to new path, old parent of the .nomedia file is no more
-     * hidden. We should scan old parent directory to ensure all files in that directory will be
-     * updated with appropriate media type.
      * <li>Because we don't update db rows for directories, we scan the oldPath to discard stale
      * directory db rows. This prevents conflicts during subsequent db operations with oldPath.
+     * <li>We need to scan newPath as well, because the new directory may have become hidden
+     * or unhidden, in which case we need to update the media types of the contained files
      * </ul>
      */
-    private void scanRenamedPathForFuse(@NonNull String oldPath, @NonNull String newPath) {
+    private void scanRenamedDirectoryForFuse(@NonNull String oldPath, @NonNull String newPath) {
         final LocalCallingIdentity token = clearLocalCallingIdentity();
         try {
-            // We should always scan oldPath to ensure stale db rows corresponding to directories in
-            // oldPath are removed. If oldPath is .nomedia file and is now moved to a new directory,
-            // we should scan parent directory of oldPath to make parent directory non-hidden.
-            final File oldPathToScan = extractDisplayName(oldPath).equals(".nomedia") ?
-                    new File(oldPath).getParentFile() : new File(oldPath);
-            scanFile(oldPathToScan, REASON_DEMAND);
-
-            // We should always scan new path to update the media type, but if new file is .nomedia
-            // we should scan new parent as well
-            final File newPathToScan = extractDisplayName(newPath).equals(".nomedia") ?
-                    new File(newPath).getParentFile() : new File(newPath);
-            scanFile(newPathToScan, REASON_DEMAND);
+            scanFile(new File(oldPath), REASON_DEMAND);
+            scanFile(new File(newPath), REASON_DEMAND);
         } finally {
             restoreLocalCallingIdentity(token);
         }
@@ -1617,13 +1665,15 @@ public class MediaProvider extends ContentProvider {
     /**
      * Gets {@link ContentValues} for updating database entry to {@code path}.
      */
-    private ContentValues getContentValuesForFuseRename(String path, String oldMimeType,
-            String newMimeType) {
+    private ContentValues getContentValuesForFuseRename(String path, String newMimeType,
+            boolean checkHidden) {
         ContentValues values = new ContentValues();
         values.put(MediaColumns.MIME_TYPE, newMimeType);
         values.put(MediaColumns.DATA, path);
 
-        if (!oldMimeType.equalsIgnoreCase(newMimeType)) {
+        if (checkHidden && shouldFileBeHidden(new File(path))) {
+            values.put(FileColumns.MEDIA_TYPE, FileColumns.MEDIA_TYPE_NONE);
+        } else {
             int mediaType = MimeUtils.resolveMediaType(newMimeType);
             values.put(FileColumns.MEDIA_TYPE, mediaType);
         }
@@ -1808,7 +1858,8 @@ public class MediaProvider extends ContentProvider {
                 final String newFilePath = newPath + "/" + filePath;
                 final String mimeType = MimeUtils.resolveMimeType(new File(newFilePath));
                 if(!updateDatabaseForFuseRename(helper, oldPath + "/" + filePath, newFilePath,
-                        getContentValuesForFuseRename(newFilePath, mimeType, mimeType), qbExtras)) {
+                        getContentValuesForFuseRename(newFilePath, mimeType,
+                                false /* checkHidden  - will be fixed up below */), qbExtras)) {
                     Log.e(TAG, "Calling package doesn't have write permission to rename file.");
                     return OsConstants.EPERM;
                 }
@@ -1824,8 +1875,8 @@ public class MediaProvider extends ContentProvider {
         } finally {
             helper.endTransaction();
         }
-        // File or directory movement might have made new/old path hidden.
-        scanRenamedPathForFuse(oldPath, newPath);
+        // Directory movement might have made new/old path hidden.
+        scanRenamedDirectoryForFuse(oldPath, newPath);
         return 0;
     }
 
@@ -1859,6 +1910,21 @@ public class MediaProvider extends ContentProvider {
         return renameFileForFuse(oldPath, newPath, /* bypassRestrictions */ true) ;
     }
 
+    private static boolean shouldFileBeHidden(@NonNull File file) {
+        if (FileUtils.isFileHidden(file)) {
+            return true;
+        }
+        File parent = file.getParentFile();
+        while (parent != null) {
+            if (FileUtils.isDirectoryHidden(parent)) {
+                return true;
+            }
+            parent = parent.getParentFile();
+        }
+
+        return false;
+    }
+
     private int renameFileForFuse(String oldPath, String newPath, boolean bypassRestrictions) {
         final DatabaseHelper helper;
         try {
@@ -1870,9 +1936,8 @@ public class MediaProvider extends ContentProvider {
         helper.beginTransaction();
         try {
             final String newMimeType = MimeUtils.resolveMimeType(new File(newPath));
-            final String oldMimeType = MimeUtils.resolveMimeType(new File(oldPath));
             if (!updateDatabaseForFuseRename(helper, oldPath, newPath,
-                    getContentValuesForFuseRename(newPath, oldMimeType, newMimeType))) {
+                    getContentValuesForFuseRename(newPath, newMimeType, true /* checkHidden */))) {
                 if (!bypassRestrictions) {
                     Log.e(TAG, "Calling package doesn't have write permission to rename file.");
                     return OsConstants.EPERM;
@@ -1892,8 +1957,22 @@ public class MediaProvider extends ContentProvider {
         } finally {
             helper.endTransaction();
         }
-        // File or directory movement might have made new/old path hidden.
-        scanRenamedPathForFuse(oldPath, newPath);
+        // The above code should have taken are of the mime/media type of the new file,
+        // even if it was moved to/from a hidden directory.
+        // This leaves cases where the source/dest of the move is a .nomedia file itself. Eg:
+        // 1) /sdcard/foo/.nomedia => /sdcard/foo/bar.mp3
+        //    in this case, the code above has given bar.mp3 the correct mime type, but we should
+        //    still can /sdcard/foo, because it's now no longer hidden
+        // 2) /sdcard/foo/.nomedia => /sdcard/bar/.nomedia
+        //    in this case, we need to scan both /sdcard/foo and /sdcard/bar/
+        // 3) /sdcard/foo/bar.mp3 => /sdcard/foo/.nomedia
+        //    in this case, we need to scan all of /sdcard/foo
+        if (extractDisplayName(oldPath).equals(".nomedia")) {
+            scanFile(new File(oldPath).getParentFile(), REASON_DEMAND);
+        }
+        if (extractDisplayName(newPath).equals(".nomedia")) {
+            scanFile(new File(newPath).getParentFile(), REASON_DEMAND);
+        }
         return 0;
     }
 
@@ -2076,6 +2155,9 @@ public class MediaProvider extends ContentProvider {
             CancellationSignal signal) throws FallbackException {
         queryArgs = (queryArgs != null) ? queryArgs : new Bundle();
 
+        // INCLUDED_DEFAULT_DIRECTORIES extra should only be set inside MediaProvider.
+        queryArgs.remove(INCLUDED_DEFAULT_DIRECTORIES);
+
         final ArraySet<String> honoredArgs = new ArraySet<>();
         DatabaseUtils.resolveQueryArgs(queryArgs, honoredArgs::add, this::ensureCustomCollator);
 
@@ -2175,7 +2257,8 @@ public class MediaProvider extends ContentProvider {
         if (c != null) {
             // As a performance optimization, only configure notifications when
             // resulting cursor will leave our process
-            if (mCallingIdentity.get().pid != android.os.Process.myPid()) {
+            final boolean callerIsRemote = mCallingIdentity.get().pid != android.os.Process.myPid();
+            if (callerIsRemote && !isFuseThread()) {
                 c.setNotificationUri(getContext().getContentResolver(), uri);
             }
 
@@ -2377,13 +2460,55 @@ public class MediaProvider extends ContentProvider {
         if (!TextUtils.isEmpty(values.getAsString(MediaColumns.DATA))) {
             FileUtils.computeValuesFromData(values, isFuseThread());
         }
-        // Extract the MIME type from the display name if we couldn't resolve it from the raw path
-        if (!TextUtils.isEmpty(values.getAsString(MediaColumns.DISPLAY_NAME))) {
-            final String displayName = values.getAsString(MediaColumns.DISPLAY_NAME);
 
-            if (TextUtils.isEmpty(values.getAsString(MediaColumns.MIME_TYPE))) {
-                values.put(
-                        MediaColumns.MIME_TYPE, MimeUtils.resolveMimeType(new File(displayName)));
+        final boolean isTargetSdkROrHigher =
+                getCallingPackageTargetSdkVersion() >= Build.VERSION_CODES.R;
+        final String displayName = values.getAsString(MediaColumns.DISPLAY_NAME);
+        final String mimeTypeFromExt = TextUtils.isEmpty(displayName) ? null :
+                MimeUtils.resolveMimeType(new File(displayName));
+
+        if (TextUtils.isEmpty(values.getAsString(MediaColumns.MIME_TYPE))) {
+            if (isTargetSdkROrHigher) {
+                // Extract the MIME type from the display name if we couldn't resolve it from the
+                // raw path
+                if (mimeTypeFromExt != null) {
+                    values.put(MediaColumns.MIME_TYPE, mimeTypeFromExt);
+                } else {
+                    // We couldn't resolve mimeType, it means that both display name and MIME type
+                    // were missing in values, so we use defaultMimeType.
+                    values.put(MediaColumns.MIME_TYPE, defaultMimeType);
+                }
+            } else if (defaultMediaType == FileColumns.MEDIA_TYPE_NONE) {
+                values.put(MediaColumns.MIME_TYPE, mimeTypeFromExt);
+            } else {
+                // We don't use mimeTypeFromExt to preserve legacy behavior.
+                values.put(MediaColumns.MIME_TYPE, defaultMimeType);
+            }
+        }
+
+        String mimeType = values.getAsString(MediaColumns.MIME_TYPE);
+        if (defaultMediaType == FileColumns.MEDIA_TYPE_NONE) {
+            // We allow any mimeType for generic uri with default media type as MEDIA_TYPE_NONE.
+        } else if (mimeType != null &&
+                MimeTypeMap.getSingleton().getExtensionFromMimeType(mimeType) == null) {
+            if (mimeTypeFromExt != null &&
+                    defaultMediaType == MimeUtils.resolveMediaType(mimeTypeFromExt)) {
+                // If mimeType from extension matches the defaultMediaType of uri, we use mimeType
+                // from file extension as mimeType. This is an effort to guess the mimeType when we
+                // get unsupported mimeType.
+                // Note: We can't force defaultMimeType because when we force defaultMimeType, we
+                // will force the file extension as well. For example, if DISPLAY_NAME=Foo.png and
+                // mimeType="image/*". If we force mimeType to be "image/jpeg", we append the file
+                // name with the new file extension i.e., "Foo.png.jpg" where as the expected file
+                // name was "Foo.png"
+                values.put(MediaColumns.MIME_TYPE, mimeTypeFromExt);
+            } else if (isTargetSdkROrHigher) {
+                // We are here because given mimeType is unsupported also we couldn't guess valid
+                // mimeType from file extension.
+                throw new IllegalArgumentException("Unsupported MIME type " + mimeType);
+            } else {
+                // We can't throw error for legacy apps, so we try to use defaultMimeType.
+                values.put(MediaColumns.MIME_TYPE, defaultMimeType);
             }
         }
 
@@ -2396,12 +2521,10 @@ public class MediaProvider extends ContentProvider {
         final int format = formatObject == null ? 0 : formatObject.intValue();
         if (format == MtpConstants.FORMAT_ASSOCIATION) {
             values.putNull(MediaColumns.MIME_TYPE);
-        } else if (TextUtils.isEmpty(values.getAsString(MediaColumns.MIME_TYPE))) {
-            values.put(MediaColumns.MIME_TYPE, defaultMimeType);
         }
 
+        mimeType = values.getAsString(MediaColumns.MIME_TYPE);
         // Sanity check MIME type against table
-        final String mimeType = values.getAsString(MediaColumns.MIME_TYPE);
         if (mimeType != null) {
             final int actualMediaType = MimeUtils.resolveMediaType(mimeType);
             if (defaultMediaType == FileColumns.MEDIA_TYPE_NONE) {
@@ -2530,7 +2653,7 @@ public class MediaProvider extends ContentProvider {
 
             // Allow apps with MANAGE_EXTERNAL_STORAGE to create files anywhere
             if (!validPath) {
-                validPath = isCallingPackageExternalStorageManager();
+                validPath = isCallingPackageManager();
             }
 
             // Allow system gallery to create image/video files.
@@ -2557,6 +2680,10 @@ public class MediaProvider extends ContentProvider {
                 throw new IllegalStateException("Failed to create directory: " + res);
             }
             values.put(MediaColumns.DATA, res.getAbsolutePath());
+            // buildFile may have changed the file name, compute values to extract new DISPLAY_NAME.
+            // Note: We can't extract displayName from res.getPath() because for pending & trashed
+            // files DISPLAY_NAME will not be same as file name.
+            FileUtils.computeValuesFromData(values, isFuseThread());
         } else {
             assertFileColumnsSane(match, uri, values);
         }
@@ -2867,10 +2994,12 @@ public class MediaProvider extends ContentProvider {
 
         if (mimeType != null) {
             values.put(FileColumns.MIME_TYPE, mimeType);
-            if (isCallingPackageSystem() && values.containsKey(FileColumns.MEDIA_TYPE)) {
+            if (isCallingPackageSelf() && values.containsKey(FileColumns.MEDIA_TYPE)) {
                 // Leave FileColumns.MEDIA_TYPE untouched if the caller is ModernMediaScanner and
                 // FileColumns.MEDIA_TYPE is already populated.
-            } else{
+            } else if (path != null && shouldFileBeHidden(new File(path))) {
+                values.put(FileColumns.MEDIA_TYPE, FileColumns.MEDIA_TYPE_NONE);
+            } else {
                 values.put(FileColumns.MEDIA_TYPE, MimeUtils.resolveMediaType(mimeType));
             }
         } else {
@@ -2936,8 +3065,10 @@ public class MediaProvider extends ContentProvider {
             try {
                 return qb.insert(helper, values);
             } catch (SQLiteConstraintException e) {
+                final String packages = getAllowedPackagesForUpsert(
+                        values.getAsString(MediaColumns.OWNER_PACKAGE_NAME));
                 SQLiteQueryBuilder qbForUpsert = getQueryBuilderForUpsert(path);
-                final long rowId = getIdIfPathExistsForCallingPackage(qbForUpsert, helper, path);
+                final long rowId = getIdIfPathOwnedByPackages(qbForUpsert, helper, path, packages);
                 // Apps sometimes create a file via direct path and then insert it into
                 // MediaStore via ContentResolver. The former should create a database entry,
                 // so we have to treat the latter as an upsert.
@@ -2953,24 +3084,48 @@ public class MediaProvider extends ContentProvider {
     }
 
     /**
-     * @return row id of the entry with path {@code path} and owner as shared calling package, if it
-     * exists.
+     * @return row id of the entry with path {@code path} if the owner is one of {@code packages}.
      */
-    private long getIdIfPathExistsForCallingPackage(@NonNull SQLiteQueryBuilder qb,
-            @NonNull DatabaseHelper helper, String path) {
-        final String[] projection = new String[] {FileColumns._ID, FileColumns.OWNER_PACKAGE_NAME};
-        final String selection = FileColumns.DATA + " =? ";
+    private long getIdIfPathOwnedByPackages(@NonNull SQLiteQueryBuilder qb,
+            @NonNull DatabaseHelper helper, String path, String packages) {
+        final String[] projection = new String[] {FileColumns._ID};
+        final  String ownerPackageMatchClause = DatabaseUtils.bindSelection(
+                MediaColumns.OWNER_PACKAGE_NAME + " IN " + packages);
+        final String selection = FileColumns.DATA + " =? AND " + ownerPackageMatchClause;
 
         try (Cursor c = qb.query(helper, projection, selection, new String[] {path}, null, null,
                 null, null, null)) {
             if (c.moveToFirst()) {
-                final String ownerPackage = c.getString(1);
-                if (ownerPackage != null && isCallingIdentitySharedPackageName(ownerPackage)) {
-                    return c.getLong(0);
-                }
+                return c.getLong(0);
             }
         }
         return -1;
+    }
+
+    /**
+     * Gets packages that should match to upsert a db row.
+     *
+     * A database row can be upserted if
+     * <ul>
+     * <li> Calling package or one of the shared packages owns the db row.
+     * <li> {@code givenOwnerPackage} owns the db row. This is useful when DownloadProvider
+     * requests upsert on behalf of another app
+     * </ul>
+     */
+    private String getAllowedPackagesForUpsert(@Nullable String givenOwnerPackage) {
+        ArrayList<String> packages = new ArrayList<>();
+        packages.addAll(Arrays.asList(mCallingIdentity.get().getSharedPackageNames()));
+
+        // If givenOwnerPackage is CallingIdentity, packages list would already have shared package
+        // names of givenOwnerPackage. If givenOwnerPackage is not CallingIdentity, since
+        // DownloadProvider can upsert a row on behalf of app, we should include all shared packages
+        // of givenOwnerPackage.
+        if (givenOwnerPackage != null && isCallingPackageDelegator() &&
+                !isCallingIdentitySharedPackageName(givenOwnerPackage)) {
+            // Allow DownloadProvider to Upsert if givenOwnerPackage is owner of the db row.
+            packages.addAll(Arrays.asList(getSharedPackagesForPackage(givenOwnerPackage)));
+        }
+        return bindList((Object[]) packages.toArray());
     }
 
     /**
@@ -3059,6 +3214,9 @@ public class MediaProvider extends ContentProvider {
             @Nullable Bundle extras) throws FallbackException {
         extras = (extras != null) ? extras : new Bundle();
 
+        // INCLUDED_DEFAULT_DIRECTORIES extra should only be set inside MediaProvider.
+        extras.remove(INCLUDED_DEFAULT_DIRECTORIES);
+
         final boolean allowHidden = isCallingPackageAllowedHidden();
         final int match = matchUri(uri, allowHidden);
 
@@ -3126,7 +3284,7 @@ public class MediaProvider extends ContentProvider {
             for (String column : sDataColumns.keySet()) {
                 if (!initialValues.containsKey(column)) continue;
 
-                if (isCallingPackageSystem() || isCallingPackageLegacyWrite()) {
+                if (isCallingPackageSelf() || isCallingPackageLegacyWrite()) {
                     // Mutation allowed
                 } else {
                     Log.w(TAG, "Ignoring mutation of  " + column + " from "
@@ -3137,7 +3295,7 @@ public class MediaProvider extends ContentProvider {
 
             path = initialValues.getAsString(MediaStore.MediaColumns.DATA);
 
-            if (!isCallingPackageSystem()) {
+            if (!isCallingPackageSelf()) {
                 initialValues.remove(FileColumns.IS_DOWNLOAD);
             }
 
@@ -3149,13 +3307,22 @@ public class MediaProvider extends ContentProvider {
                 initialValues.putNull(ImageColumns.LONGITUDE);
             }
 
-            if (isCallingPackageSystem() || isCallingPackageBackup()) {
-                // When media inserted by ourselves during a scan, or by a
-                // backup app, the best we can do is guess ownership based on
-                // path when it's not explicitly provided
+            if (isCallingPackageSelf() || isCallingPackageShell()) {
+                // When media inserted by ourselves during a scan, or by the
+                // shell, the best we can do is guess ownership based on path
+                // when it's not explicitly provided
                 ownerPackageName = initialValues.getAsString(FileColumns.OWNER_PACKAGE_NAME);
                 if (TextUtils.isEmpty(ownerPackageName)) {
                     ownerPackageName = extractPathOwnerPackageName(path);
+                }
+            } else if (isCallingPackageDelegator()) {
+                // When caller is a delegator, we handle ownership as a hybrid
+                // of the two other cases: we're willing to accept any ownership
+                // transfer attempted during insert, but we fall back to using
+                // the Binder identity if they don't request a specific owner
+                ownerPackageName = initialValues.getAsString(FileColumns.OWNER_PACKAGE_NAME);
+                if (TextUtils.isEmpty(ownerPackageName)) {
+                    ownerPackageName = getCallingPackageOrSelf();
                 }
             } else {
                 // Remote callers have no direct control over owner column; we force
@@ -3251,7 +3418,7 @@ public class MediaProvider extends ContentProvider {
                 values.put(MediaStore.Audio.Playlists.DATE_ADDED, System.currentTimeMillis() / 1000);
                 // Playlist names are stored as display names, but leave
                 // values untouched if the caller is ModernMediaScanner
-                if (!isCallingPackageSystem()) {
+                if (!isCallingPackageSelf()) {
                     if (values.containsKey(Playlists.NAME)) {
                         values.put(MediaColumns.DISPLAY_NAME, values.getAsString(Playlists.NAME));
                     }
@@ -3373,7 +3540,7 @@ public class MediaProvider extends ContentProvider {
                 // No special filtering needed
                 break;
             case MATCH_EXCLUDE:
-                appendWhereStandalone(qb, column + "=?", 0);
+                appendWhereStandalone(qb, getWhereClauseForMatchExclude(column));
                 break;
             case MATCH_ONLY:
                 appendWhereStandalone(qb, column + "=?", 1);
@@ -3405,9 +3572,22 @@ public class MediaProvider extends ContentProvider {
     }
 
     @Deprecated
-    private String getSharedPackages(String callingPackage) {
+    private String getSharedPackages() {
         final String[] sharedPackageNames = mCallingIdentity.get().getSharedPackageNames();
         return bindList((Object[]) sharedPackageNames);
+    }
+
+    /**
+     * Gets shared packages names for given {@code packageName}
+     */
+    private String[] getSharedPackagesForPackage(String packageName) {
+        try {
+            final int packageUid = getContext().getPackageManager()
+                    .getPackageUid(packageName, 0);
+            return getContext().getPackageManager().getPackagesForUid(packageUid);
+        } catch (NameNotFoundException ignored) {
+            return new String[] {packageName};
+        }
     }
 
     private static final int TYPE_QUERY = 0;
@@ -3456,7 +3636,7 @@ public class MediaProvider extends ContentProvider {
             qb.setDistinct(true);
         }
         qb.setStrict(true);
-        if (isCallingPackageSystem()) {
+        if (isCallingPackageSelf()) {
             // When caller is system, such as the media scanner, we're willing
             // to let them access any columns they want
         } else {
@@ -3464,8 +3644,6 @@ public class MediaProvider extends ContentProvider {
             qb.setStrictColumns(true);
             qb.setStrictGrammar(true);
         }
-
-        final String callingPackage = getCallingPackageOrSelf();
 
         // TODO: throw when requesting a currently unmounted volume
         final String volumeName = MediaStore.getVolumeName(uri);
@@ -3475,7 +3653,7 @@ public class MediaProvider extends ContentProvider {
         } else {
             includeVolumes = bindList(volumeName);
         }
-        final String sharedPackages = getSharedPackages(callingPackage);
+        final String sharedPackages = getSharedPackages();
         final String matchSharedPackagesClause = FileColumns.OWNER_PACKAGE_NAME + " IN "
                 + sharedPackages;
 
@@ -3512,6 +3690,7 @@ public class MediaProvider extends ContentProvider {
         final String filter = uri.getQueryParameter("filter");
 
         boolean includeAllVolumes = false;
+        final String callingPackage = getCallingPackageOrSelf();
 
         switch (match) {
             case IMAGES_MEDIA_ID:
@@ -4028,17 +4207,43 @@ public class MediaProvider extends ContentProvider {
             throws FallbackException {
         extras = (extras != null) ? extras : new Bundle();
 
-        final String userWhere = extras.getString(QUERY_ARG_SQL_SELECTION);
-        final String[] userWhereArgs = extras.getStringArray(QUERY_ARG_SQL_SELECTION_ARGS);
+        // INCLUDED_DEFAULT_DIRECTORIES extra should only be set inside MediaProvider.
+        extras.remove(INCLUDED_DEFAULT_DIRECTORIES);
 
         uri = safeUncanonicalize(uri);
+        final boolean allowHidden = isCallingPackageAllowedHidden();
+        final int match = matchUri(uri, allowHidden);
+
+        switch(match) {
+            case AUDIO_MEDIA_ID:
+            case AUDIO_PLAYLISTS_ID:
+            case VIDEO_MEDIA_ID:
+            case IMAGES_MEDIA_ID:
+            case DOWNLOADS_ID:
+            case FILES_ID: {
+                if (!isFuseThread() && getCachedCallingIdentityForFuse(Binder.getCallingUid()).
+                        removeDeletedRowId(Long.parseLong(uri.getLastPathSegment()))) {
+                    // Apps sometimes delete the file via filePath and then try to delete the db row
+                    // using MediaProvider#delete. Since we would have already deleted the db row
+                    // during the filePath operation, the latter will result in a security
+                    // exception. Apps which don't expect an exception will break here. Since we
+                    // have already deleted the db row, silently return zero as deleted count.
+                    return 0;
+                }
+            }
+            break;
+            default:
+                // For other match types, given uri will not correspond to a valid file.
+                break;
+        }
+
+        final String userWhere = extras.getString(QUERY_ARG_SQL_SELECTION);
+        final String[] userWhereArgs = extras.getStringArray(QUERY_ARG_SQL_SELECTION_ARGS);
 
         int count = 0;
 
         final String volumeName = getVolumeName(uri);
         final int targetSdkVersion = getCallingPackageTargetSdkVersion();
-        final boolean allowHidden = isCallingPackageAllowedHidden();
-        final int match = matchUri(uri, allowHidden);
 
         // handle MEDIA_SCANNER before calling getDatabaseForUri()
         if (match == MEDIA_SCANNER) {
@@ -4180,16 +4385,15 @@ public class MediaProvider extends ContentProvider {
             }
 
             if (deletedDownloadIds.size() > 0) {
-                final long token = Binder.clearCallingIdentity();
-                try {
+                // Do this on a background thread, since we don't want to make binder
+                // calls as part of a FUSE call.
+                helper.postBackground(() -> {
                     getContext().getSystemService(DownloadManager.class)
                             .onMediaStoreDownloadsDeleted(deletedDownloadIds);
-                } finally {
-                    Binder.restoreCallingIdentity(token);
-                }
+                });
             }
 
-            if (isFilesTable && !isCallingPackageSystem()) {
+            if (isFilesTable && !isCallingPackageSelf()) {
                 Metrics.logDeletion(volumeName, mCallingIdentity.get().uid,
                         getCallingPackageOrSelf(), count);
             }
@@ -4408,13 +4612,7 @@ public class MediaProvider extends ContentProvider {
         final ClipData clipData = extras.getParcelable(MediaStore.EXTRA_CLIP_DATA);
         final List<Uri> uris = collectUris(clipData);
 
-        final String volumeName = MediaStore.getVolumeName(uris.get(0));
         for (Uri uri : uris) {
-            // Require that everything is on the same volume
-            if (!Objects.equals(volumeName, MediaStore.getVolumeName(uri))) {
-                throw new IllegalArgumentException("All requested items must be on same volume");
-            }
-
             final int match = matchUri(uri, false);
             switch (match) {
                 case IMAGES_MEDIA_ID:
@@ -4734,6 +4932,8 @@ public class MediaProvider extends ContentProvider {
         // Related items are only considered for new media creation, and they
         // can't be leveraged to move existing content into blocked locations
         extras.remove(QUERY_ARG_RELATED_URI);
+        // INCLUDED_DEFAULT_DIRECTORIES extra should only be set inside MediaProvider.
+        extras.remove(INCLUDED_DEFAULT_DIRECTORIES);
 
         final String userWhere = extras.getString(QUERY_ARG_SQL_SELECTION);
         final String[] userWhereArgs = extras.getStringArray(QUERY_ARG_SQL_SELECTION_ARGS);
@@ -4830,7 +5030,7 @@ public class MediaProvider extends ContentProvider {
             for (String column : sDataColumns.keySet()) {
                 if (!initialValues.containsKey(column)) continue;
 
-                if (isCallingPackageSystem() || isCallingPackageLegacyWrite()) {
+                if (isCallingPackageSelf() || isCallingPackageLegacyWrite()) {
                     // Mutation allowed
                 } else {
                     Log.w(TAG, "Ignoring mutation of  " + column + " from "
@@ -4839,12 +5039,44 @@ public class MediaProvider extends ContentProvider {
                 }
             }
 
-            if (!isCallingPackageSystem()) {
-                Trace.beginSection("filter");
+            // Enforce allowed ownership transfers
+            if (initialValues.containsKey(MediaColumns.OWNER_PACKAGE_NAME)) {
+                if (isCallingPackageSelf() || isCallingPackageShell()) {
+                    // When the caller is the media scanner or the shell, we let
+                    // them change ownership however they see fit; nothing to do
+                } else if (isCallingPackageDelegator()) {
+                    // When the caller is a delegator, allow them to shift
+                    // ownership only when current owner, or when ownerless
+                    final String currentOwner;
+                    final String proposedOwner = initialValues
+                            .getAsString(MediaColumns.OWNER_PACKAGE_NAME);
+                    final Uri genericUri = MediaStore.Files.getContentUri(volumeName,
+                            ContentUris.parseId(uri));
+                    try (Cursor c = queryForSingleItem(genericUri,
+                            new String[] { MediaColumns.OWNER_PACKAGE_NAME }, null, null, null)) {
+                        currentOwner = c.getString(0);
+                    } catch (FileNotFoundException e) {
+                        throw new IllegalStateException(e);
+                    }
+                    final boolean transferAllowed = (currentOwner == null)
+                            || Arrays.asList(getSharedPackagesForPackage(getCallingPackageOrSelf()))
+                                    .contains(currentOwner);
+                    if (transferAllowed) {
+                        Log.v(TAG, "Ownership transfer from " + currentOwner + " to "
+                                + proposedOwner + " allowed");
+                    } else {
+                        Log.w(TAG, "Ownership transfer from " + currentOwner + " to "
+                                + proposedOwner + " blocked");
+                        initialValues.remove(MediaColumns.OWNER_PACKAGE_NAME);
+                    }
+                } else {
+                    // Otherwise no ownership changes are allowed
+                    initialValues.remove(MediaColumns.OWNER_PACKAGE_NAME);
+                }
+            }
 
-                // Remote callers have no direct control over owner column; we
-                // force it be whoever is creating the content.
-                initialValues.remove(MediaColumns.OWNER_PACKAGE_NAME);
+            if (!isCallingPackageSelf()) {
+                Trace.beginSection("filter");
 
                 // We default to filtering mutable columns, except when we know
                 // the single item being updated is pending; when it's finally
@@ -4920,7 +5152,7 @@ public class MediaProvider extends ContentProvider {
             case AUDIO_PLAYLISTS_ID:
                 // Playlist names are stored as display names, but leave
                 // values untouched if the caller is ModernMediaScanner
-                if (!isCallingPackageSystem()) {
+                if (!isCallingPackageSelf()) {
                     if (initialValues.containsKey(Playlists.NAME)) {
                         initialValues.put(MediaColumns.DISPLAY_NAME,
                                 initialValues.getAsString(Playlists.NAME));
@@ -4935,7 +5167,7 @@ public class MediaProvider extends ContentProvider {
         // If we're touching columns that would change placement of a file,
         // blend in current values and recalculate path
         final boolean allowMovement = extras.getBoolean(MediaStore.QUERY_ARG_ALLOW_MOVEMENT,
-                !isCallingPackageSystem());
+                !isCallingPackageSelf());
         if (containsAny(initialValues.keySet(), sPlacementColumns)
                 && !initialValues.containsKey(MediaColumns.DATA)
                 && !isThumbnail
@@ -4957,7 +5189,9 @@ public class MediaProvider extends ContentProvider {
             }
 
             final LocalCallingIdentity token = clearLocalCallingIdentity();
-            try (Cursor c = queryForSingleItem(uri,
+            final Uri genericUri = MediaStore.Files.getContentUri(volumeName,
+                    ContentUris.parseId(uri));
+            try (Cursor c = queryForSingleItem(genericUri,
                     sPlacementColumns.toArray(new String[0]), userWhere, userWhereArgs, null)) {
                 for (int i = 0; i < c.getColumnCount(); i++) {
                     final String column = c.getColumnName(i);
@@ -5005,7 +5239,11 @@ public class MediaProvider extends ContentProvider {
                     invalidateFuseDentry(beforePath);
                     invalidateFuseDentry(afterPath);
                 } catch (ErrnoException e) {
-                    throw new IllegalStateException(e);
+                    if (e.errno == OsConstants.ENOENT) {
+                        Log.d(TAG, "Missing file at " + beforePath + "; continuing anyway");
+                    } else {
+                        throw new IllegalStateException(e);
+                    }
                 }
                 initialValues.put(MediaColumns.DATA, afterPath);
 
@@ -5034,7 +5272,7 @@ public class MediaProvider extends ContentProvider {
 
         // If we're already doing this update from an internal scan, no need to
         // kick off another no-op scan
-        if (isCallingPackageSystem()) {
+        if (isCallingPackageSelf()) {
             triggerScan = false;
         }
 
@@ -5097,7 +5335,15 @@ public class MediaProvider extends ContentProvider {
                     if (triggerScan) {
                         try (Cursor c = queryForSingleItem(updatedUri,
                                 new String[] { FileColumns.DATA }, null, null, null)) {
-                            mMediaScanner.scanFile(new File(c.getString(0)), REASON_DEMAND);
+                            final File file = new File(c.getString(0));
+                            helper.postBlocking(() -> {
+                                final LocalCallingIdentity tokenInner = clearLocalCallingIdentity();
+                                try {
+                                    mMediaScanner.scanFile(file, REASON_DEMAND);
+                                } finally {
+                                    restoreLocalCallingIdentity(tokenInner);
+                                }
+                            });
                         } catch (Exception e) {
                             Log.w(TAG, "Failed to update metadata for " + updatedUri, e);
                         }
@@ -5150,7 +5396,8 @@ public class MediaProvider extends ContentProvider {
                 extras.putInt(QUERY_ARG_MATCH_TRASHED, MATCH_INCLUDE);
                 final SQLiteQueryBuilder qbForReplace = getQueryBuilder(TYPE_DELETE,
                         matchUri(uri, allowHidden), uri, extras, null);
-                final long rowId = getIdIfPathExistsForCallingPackage(qbForReplace, helper, path);
+                final long rowId = getIdIfPathOwnedByPackages(qbForReplace, helper, path,
+                        getSharedPackages());
 
                 if (rowId != -1 && qbForReplace.delete(helper, "_id=?",
                         new String[] {Long.toString(rowId)}) == 1) {
@@ -5690,8 +5937,13 @@ public class MediaProvider extends ContentProvider {
      */
     private ParcelFileDescriptor openFileAndEnforcePathPermissionsHelper(Uri uri, int match,
             String mode, CancellationSignal signal) throws FileNotFoundException {
-        final int modeBits = ParcelFileDescriptor.parseMode(mode);
-        final boolean forWrite = (modeBits & ParcelFileDescriptor.MODE_WRITE_ONLY) != 0;
+        int modeBits = ParcelFileDescriptor.parseMode(mode);
+        boolean forWrite = (modeBits & ParcelFileDescriptor.MODE_WRITE_ONLY) != 0;
+        if (forWrite) {
+            // Upgrade 'w' only to 'rw'. This allows us acquire a WR_LOCK when calling
+            // #shouldOpenWithFuse
+            modeBits |= ParcelFileDescriptor.MODE_READ_WRITE;
+        }
 
         final boolean hasOwnerPackageName = hasOwnerPackageName(uri);
         final String[] projection = new String[] {
@@ -5721,7 +5973,8 @@ public class MediaProvider extends ContentProvider {
 
         checkAccess(uri, Bundle.EMPTY, file, forWrite);
 
-        if (isPending) {
+        // We don't check ownership for files with IS_PENDING set by FUSE
+        if (isPending && !isPendingFromFuse(file)) {
             requireOwnershipForItem(ownerPackageName, uri);
         }
 
@@ -5804,9 +6057,10 @@ public class MediaProvider extends ContentProvider {
                 } catch (FileNotFoundException ignored) {
                 }
                 ParcelFileDescriptor lowerFsFd = FileUtils.openSafely(file, modeBits);
-                boolean forRead = (modeBits & ParcelFileDescriptor.MODE_READ_ONLY) != 0;
+                // Always acquire a readLock. This allows us make multiple opens via lower
+                // filesystem
                 boolean shouldOpenWithFuse = daemon != null
-                        && daemon.shouldOpenWithFuse(filePath, forRead, lowerFsFd.getFd());
+                        && daemon.shouldOpenWithFuse(filePath, true /* forRead */, lowerFsFd.getFd());
 
                 if (SystemProperties.getBoolean(PROP_FUSE, false) && shouldOpenWithFuse) {
                     // If the file is already opened on the FUSE mount with VFS caching enabled
@@ -5939,7 +6193,7 @@ public class MediaProvider extends ContentProvider {
             return true;
         }
 
-        if (isCallingPackageExternalStorageManager()) {
+        if (isCallingPackageManager()) {
             return true;
         }
 
@@ -6174,16 +6428,25 @@ public class MediaProvider extends ContentProvider {
     }
 
     /**
+     * @return {@code true} if {@code file} is pending from FUSE, {@code false} otherwise.
+     * Files pending from FUSE will not have pending file pattern.
+     */
+    private static boolean isPendingFromFuse(@NonNull File file) {
+        final Matcher matcher =
+                FileUtils.PATTERN_EXPIRES_FILE.matcher(extractDisplayName(file.getName()));
+        return !matcher.matches();
+    }
+
+    /**
      * Checks if the app identified by the given UID is allowed to open the given file for the given
      * access mode.
      *
      * @param path the path of the file to be opened
      * @param uid UID of the app requesting to open the file
      * @param forWrite specifies if the file is to be opened for write
-     * @return 0 upon success. If the operation is illegal or not permitted, returns
-     * {@link OsConstants#ENOENT} to prevent malicious apps from distinguishing whether a file
-     * they have no access to exists or not, or {@link OsConstants#EACCES} or if the calling package
-     * is a legacy app that doesn't have right storage permission.
+     * @return 0 upon success. {@link OsConstants#EACCES} if the operation is illegal or not
+     * permitted for the given {@code uid} or if the calling package is a legacy app that doesn't
+     * have right storage permission.
      *
      * Called from JNI in jni/MediaProviderWrapper.cpp
      */
@@ -6227,23 +6490,22 @@ public class MediaProvider extends ContentProvider {
             final File file = new File(path);
             checkAccess(fileUri, Bundle.EMPTY, file, forWrite);
 
-            final Matcher matcher =
-                    FileUtils.PATTERN_EXPIRES_FILE.matcher(extractDisplayName(path));
-            final boolean isPendingFromFuse = !matcher.matches();
-            // For filePath operations, we don't check ownership for files with IS_PENDING set by
-            // FUSE
-            if (isPending && !isPendingFromFuse) {
+            // We don't check ownership for files with IS_PENDING set by FUSE
+            if (isPending && !isPendingFromFuse(new File(path))) {
                 requireOwnershipForItem(ownerPackageName, fileUri);
             }
             return 0;
         } catch (FileNotFoundException e) {
+            // We are here because
+            // * App doesn't have read permission to the requested path, hence queryForSingleItem
+            //   couldn't return a valid db row, or,
+            // * There is no db row corresponding to the requested path, which is more unlikely.
+            // In both of these cases, it means that app doesn't have access permission to the file.
             Log.e(TAG, "Couldn't find file: " + path);
-            // It's an illegal state because FuseDaemon shouldn't forward the request if
-            // the file doesn't exist.
-            throw new IllegalStateException(e);
+            return OsConstants.EACCES;
         } catch (IllegalStateException | SecurityException e) {
             Log.e(TAG, "Permission to access file: " + path + " is denied");
-            return OsConstants.ENOENT;
+            return OsConstants.EACCES;
         } finally {
             restoreLocalCallingIdentity(token);
         }
@@ -6319,16 +6581,22 @@ public class MediaProvider extends ContentProvider {
         return uri;
     }
 
-    private boolean fileExists(@NonNull String absolutePath, @NonNull Uri contentUri) {
+    private boolean fileExists(@NonNull String absolutePath) {
         // We don't care about specific columns in the match,
         // we just want to check IF there's a match
         final String[] projection = {};
         final String selection = FileColumns.DATA + " = ?";
         final String[] selectionArgs = {absolutePath};
+        final Uri uri = FileUtils.getContentUriForPath(absolutePath);
 
-        try (final Cursor c = query(contentUri, projection, selection, selectionArgs, null)) {
-            // Shouldn't return null
-            return c.getCount() > 0;
+        final LocalCallingIdentity token = clearLocalCallingIdentity();
+        try {
+            try (final Cursor c = query(uri, projection, selection, selectionArgs, null)) {
+                // Shouldn't return null
+                return c.getCount() > 0;
+            }
+        } finally {
+            clearLocalCallingIdentity(token);
         }
     }
 
@@ -6398,11 +6666,30 @@ public class MediaProvider extends ContentProvider {
             final String mimeType = MimeUtils.resolveMimeType(new File(path));
 
             if (shouldBypassFuseRestrictions(/*forWrite*/ true, path)) {
-                // Ignore insert errors for apps that bypass scoped storage restriction.
-                try {
-                    insertFileForFuse(path, FileUtils.getContentUriForPath(path), mimeType,
-                            /*useData*/ isCallingPackageRequestingLegacy());
-                } catch (Exception ignored) {}
+                final boolean callerRequestingLegacy = isCallingPackageRequestingLegacy();
+                if (!fileExists(path)) {
+                    // If app has already inserted the db row, inserting the row again might set
+                    // IS_PENDING=1. We shouldn't overwrite existing entry as part of FUSE
+                    // operation, hence, insert the db row only when it doesn't exist.
+                    try {
+                        insertFileForFuse(path, FileUtils.getContentUriForPath(path),
+                                mimeType, /*useData*/ callerRequestingLegacy);
+                    } catch (Exception ignored) {
+                    }
+                } else {
+                    // Upon creating a file via FUSE, if a row matching the path already exists
+                    // but a file doesn't exist on the filesystem, we transfer ownership to the
+                    // app attempting to create the file. If we don't update ownership, then the
+                    // app that inserted the original row may be able to observe the contents of
+                    // written file even though they don't hold the right permissions to do so.
+                    if (callerRequestingLegacy) {
+                        final String owner = getCallingPackageOrSelf();
+                        if (owner != null && !updateOwnerForPath(path, owner)) {
+                            return OsConstants.EPERM;
+                        }
+                    }
+                }
+
                 return 0;
             }
 
@@ -6412,11 +6699,12 @@ public class MediaProvider extends ContentProvider {
                 return OsConstants.EPERM;
             }
 
-            final Uri contentUri = getContentUriForFile(path, mimeType);
-            if (fileExists(path, contentUri)) {
+            if (fileExists(path)) {
+                // If the file already exists in the db, we shouldn't allow the file creation.
                 return OsConstants.EEXIST;
             }
 
+            final Uri contentUri = getContentUriForFile(path, mimeType);
             final Uri item = insertFileForFuse(path, contentUri, mimeType, /*useData*/ false);
             if (item == null) {
                 return OsConstants.EPERM;
@@ -6428,6 +6716,23 @@ public class MediaProvider extends ContentProvider {
         } finally {
             restoreLocalCallingIdentity(token);
         }
+    }
+
+    private boolean updateOwnerForPath(@NonNull String path, @NonNull String newOwner) {
+        final DatabaseHelper helper;
+        try {
+            helper = getDatabaseForUri(FileUtils.getContentUriForPath(path));
+        } catch (VolumeNotFoundException e) {
+            // Cannot happen, as this is a path that we already resolved.
+            throw new AssertionError("Path must already be resolved", e);
+        }
+
+        ContentValues values = new ContentValues(1);
+        values.put(FileColumns.OWNER_PACKAGE_NAME, newOwner);
+
+        return helper.runWithoutTransaction((db) -> {
+            return db.update("files", values, "_data=?", new String[] { path });
+        }) == 1;
     }
 
     private static int deleteFileUnchecked(@NonNull String path) {
@@ -6573,9 +6878,19 @@ public class MediaProvider extends ContentProvider {
                 clearLocalCallingIdentity(getCachedCallingIdentityForFuse(uid));
 
         try {
+            if ("/storage/emulated".equals(path)) {
+                return OsConstants.EPERM;
+            }
             if (isPrivatePackagePathNotOwnedByCaller(path)) {
                 Log.e(TAG, "Can't access another app's external directory!");
                 return OsConstants.ENOENT;
+            }
+
+            // Do not allow apps to open Android/data or Android/obb dirs. Installer and
+            // MOUNT_EXTERNAL_ANDROID_WRITABLE apps won't be blocked by this, as their OBB dirs
+            // are mounted to lowerfs directly.
+            if (isDataOrObbPath(path)) {
+                return OsConstants.EACCES;
             }
 
             if (shouldBypassFuseRestrictions(/*forWrite*/ false, path)) {
@@ -6606,12 +6921,12 @@ public class MediaProvider extends ContentProvider {
 
     private boolean checkCallingPermissionGlobal(Uri uri, boolean forWrite) {
         // System internals can work with all media
-        if (isCallingPackageSystem()) {
+        if (isCallingPackageSelf() || isCallingPackageShell()) {
             return true;
         }
 
         // Apps that have permission to manage external storage can work with all files
-        if (isCallingPackageExternalStorageManager()) {
+        if (isCallingPackageManager()) {
             return true;
         }
 
@@ -7217,6 +7532,7 @@ public class MediaProvider extends ContentProvider {
         sMutableColumns.add(MediaStore.MediaColumns.IS_PENDING);
         sMutableColumns.add(MediaStore.MediaColumns.IS_TRASHED);
         sMutableColumns.add(MediaStore.MediaColumns.IS_FAVORITE);
+        sMutableColumns.add(MediaStore.MediaColumns.OWNER_PACKAGE_NAME);
 
         sMutableColumns.add(MediaStore.Audio.AudioColumns.BOOKMARK);
 
@@ -7227,6 +7543,9 @@ public class MediaProvider extends ContentProvider {
         sMutableColumns.add(MediaStore.Audio.Playlists.NAME);
         sMutableColumns.add(MediaStore.Audio.Playlists.Members.AUDIO_ID);
         sMutableColumns.add(MediaStore.Audio.Playlists.Members.PLAY_ORDER);
+
+        sMutableColumns.add(MediaStore.DownloadColumns.DOWNLOAD_URI);
+        sMutableColumns.add(MediaStore.DownloadColumns.REFERER_URI);
 
         sMutableColumns.add(MediaStore.Files.FileColumns.MIME_TYPE);
         sMutableColumns.add(MediaStore.Files.FileColumns.MEDIA_TYPE);
@@ -7321,28 +7640,34 @@ public class MediaProvider extends ContentProvider {
     }
 
     @Deprecated
-    private int getCallingPackageTargetSdkVersion() {
+    @VisibleForTesting
+    public int getCallingPackageTargetSdkVersion() {
         return mCallingIdentity.get().getTargetSdkVersion();
     }
 
     @Deprecated
     private boolean isCallingPackageAllowedHidden() {
-        return isCallingPackageSystem();
+        return isCallingPackageSelf();
     }
 
     @Deprecated
-    private boolean isCallingPackageSystem() {
-        return mCallingIdentity.get().hasPermission(PERMISSION_IS_SYSTEM);
+    private boolean isCallingPackageSelf() {
+        return mCallingIdentity.get().hasPermission(PERMISSION_IS_SELF);
     }
 
     @Deprecated
-    private boolean isCallingPackageBackup() {
-        return mCallingIdentity.get().hasPermission(PERMISSION_IS_BACKUP);
+    private boolean isCallingPackageShell() {
+        return mCallingIdentity.get().hasPermission(PERMISSION_IS_SHELL);
     }
 
     @Deprecated
-    private boolean isCallingPackageLegacyWrite() {
-        return mCallingIdentity.get().hasPermission(PERMISSION_IS_LEGACY_WRITE);
+    private boolean isCallingPackageManager() {
+        return mCallingIdentity.get().hasPermission(PERMISSION_IS_MANAGER);
+    }
+
+    @Deprecated
+    private boolean isCallingPackageDelegator() {
+        return mCallingIdentity.get().hasPermission(PERMISSION_IS_DELEGATOR);
     }
 
     @Deprecated
@@ -7350,10 +7675,10 @@ public class MediaProvider extends ContentProvider {
         return mCallingIdentity.get().hasPermission(PERMISSION_IS_LEGACY_READ);
     }
 
-    private boolean isCallingPackageExternalStorageManager() {
-        return mCallingIdentity.get().hasPermission(PERMISSION_MANAGE_EXTERNAL_STORAGE);
+    @Deprecated
+    private boolean isCallingPackageLegacyWrite() {
+        return mCallingIdentity.get().hasPermission(PERMISSION_IS_LEGACY_WRITE);
     }
-
 
     @Override
     public void dump(FileDescriptor fd, PrintWriter writer, String[] args) {

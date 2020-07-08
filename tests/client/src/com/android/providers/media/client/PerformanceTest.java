@@ -16,6 +16,7 @@
 
 package com.android.providers.media.client;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 import android.content.ContentProviderOperation;
@@ -25,8 +26,8 @@ import android.content.ContentValues;
 import android.database.ContentObserver;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.SystemClock;
-import android.platform.test.scenario.annotation.Scenario;
 import android.provider.MediaStore;
 import android.provider.MediaStore.MediaColumns;
 import android.util.Log;
@@ -37,9 +38,12 @@ import androidx.test.runner.AndroidJUnit4;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
+import java.io.File;
+import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -48,7 +52,6 @@ import java.util.concurrent.TimeUnit;
  * Since we're right in the critical path between camera and gallery apps, we
  * need to meet some pretty strict performance deadlines.
  */
-@Scenario
 @RunWith(AndroidJUnit4.class)
 public class PerformanceTest {
     private static final String TAG = "PerformanceTest";
@@ -232,6 +235,62 @@ public class PerformanceTest {
             timers.notifyDelete.stop();
         }
         MediaStore.waitForIdle(resolver);
+    }
+
+    @Test
+    public void testDirOperations_10() throws Exception {
+        Timer createTimer = new Timer("mkdir");
+        Timer readTimer = new Timer("readdir");
+        Timer deleteTimer = new Timer("rmdir");
+        for (int i = 0; i < COUNT_REPEAT; i++ ){
+            doDirOperations(10, createTimer, readTimer, deleteTimer);
+        }
+        createTimer.dumpResults();
+        readTimer.dumpResults();
+        deleteTimer.dumpResults();
+    }
+
+    @Test
+    public void testDirOperations_100() throws Exception {
+        Timer createTimer = new Timer("mkdir");
+        Timer readTimer = new Timer("readdir");
+        Timer deleteTimer = new Timer("rmdir");
+        for (int i = 0; i < COUNT_REPEAT; i++ ){
+            doDirOperations(100, createTimer, readTimer, deleteTimer);
+        }
+        createTimer.dumpResults();
+        readTimer.dumpResults();
+        deleteTimer.dumpResults();
+    }
+
+    private void doDirOperations(int size, Timer createTimer, Timer readTimer, Timer deleteTimer)
+            throws Exception {
+        createTimer.start();
+        File testDir = new File(new File(Environment.getExternalStorageDirectory(),
+                "Download"), "test_dir_" + System.nanoTime());
+        testDir.mkdir();
+        List<File> files = new ArrayList<>();
+        for (int i = 0; i < size; i++) {
+            File file = new File(testDir, "file_" + System.nanoTime());
+            assertTrue(file.createNewFile());
+            files.add(file);
+        }
+        createTimer.stop();
+
+        try {
+            readTimer.start();
+            File[] result = testDir.listFiles();
+            readTimer.stop();
+            assertEquals(size, result.length);
+
+        } finally {
+            deleteTimer.start();
+            for (File file : files) {
+                assertTrue(file.delete());
+            }
+            assertTrue(testDir.delete());
+            deleteTimer.stop();
+        }
     }
 
     private static Set<Uri> asSet(Collection<Uri> uris) {

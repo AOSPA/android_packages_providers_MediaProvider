@@ -20,7 +20,7 @@ android_test {
 
     static_libs: [
         "androidx.test.rules",
-        "common-platform-scenarios",
+        "collector-device-lib-platform",
         "mockito-target",
         "truth-prebuilt",
     ],

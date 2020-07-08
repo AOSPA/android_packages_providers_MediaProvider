@@ -217,6 +217,16 @@ int renameInternal(JNIEnv* env, jobject media_provider_object, jmethodID mid_ren
     }
     return res;
 }
+
+void onFileCreatedInternal(JNIEnv* env, jobject media_provider_object,
+                           jmethodID mid_on_file_created, const string& path) {
+    ScopedLocalRef<jstring> j_path(env, env->NewStringUTF(path.c_str()));
+
+    env->CallVoidMethod(media_provider_object, mid_on_file_created, j_path.get());
+    CheckForJniException(env);
+    return;
+}
+
 }  // namespace
 /*****************************************************************************************/
 /******************************* Public API Implementation *******************************/
@@ -266,6 +276,8 @@ MediaProviderWrapper::MediaProviderWrapper(JNIEnv* env, jobject media_provider) 
                               /*is_static*/ false);
     mid_is_uid_for_package_ = CacheMethod(env, "isUidForPackage", "(Ljava/lang/String;I)Z",
                               /*is_static*/ false);
+    mid_on_file_created_ = CacheMethod(env, "onFileCreated", "(Ljava/lang/String;)V",
+                                       /*is_static*/ false);
 }
 
 MediaProviderWrapper::~MediaProviderWrapper() {
@@ -292,7 +304,7 @@ std::unique_ptr<RedactionInfo> MediaProviderWrapper::GetRedactionInfo(const stri
 }
 
 int MediaProviderWrapper::InsertFile(const string& path, uid_t uid) {
-    if (shouldBypassMediaProvider(uid)) {
+    if (uid == ROOT_UID) {
         return 0;
     }
 
@@ -301,7 +313,7 @@ int MediaProviderWrapper::InsertFile(const string& path, uid_t uid) {
 }
 
 int MediaProviderWrapper::DeleteFile(const string& path, uid_t uid) {
-    if (shouldBypassMediaProvider(uid)) {
+    if (uid == ROOT_UID) {
         int res = unlink(path.c_str());
         ScanFile(path);
         return res;
@@ -399,6 +411,12 @@ int MediaProviderWrapper::Rename(const string& old_path, const string& new_path,
 
     JNIEnv* env = MaybeAttachCurrentThread();
     return renameInternal(env, media_provider_object_, mid_rename_, old_path, new_path, uid);
+}
+
+void MediaProviderWrapper::OnFileCreated(const string& path) {
+    JNIEnv* env = MaybeAttachCurrentThread();
+
+    return onFileCreatedInternal(env, media_provider_object_, mid_on_file_created_, path);
 }
 
 /*****************************************************************************************/
