@@ -1432,7 +1432,8 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 + "NULL AS data2,artist_key||' '||album_key||' '||title_key AS match,"
                 + "'content://media/external/audio/media/'||searchhelpertitle._id"
                 + " AS suggest_intent_data,"
-                + "3 AS grouporder FROM searchhelpertitle WHERE (title != '')");
+                + "3 AS grouporder,"
+                + "_id as rowid FROM searchhelpertitle WHERE (title != '')");
 
         db.execSQL("CREATE VIEW audio AS SELECT "
                 + getColumnsForCollection(Audio.Media.class)
@@ -1453,6 +1454,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 + ", artist_key AS " + Audio.Artists.ARTIST_KEY
                 + ", COUNT(DISTINCT album_id) AS " + Audio.Artists.NUMBER_OF_ALBUMS
                 + ", COUNT(DISTINCT _id) AS " + Audio.Artists.NUMBER_OF_TRACKS
+                + ", _id as rowid"
                 + " FROM audio"
                 + " WHERE is_music=1 AND is_pending=0 AND is_trashed=0"
                 + " AND volume_name IN " + filterVolumeNames
@@ -1472,6 +1474,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 + ", MIN(year) AS " + Audio.Albums.FIRST_YEAR
                 + ", MAX(year) AS " + Audio.Albums.LAST_YEAR
                 + ", NULL AS " + Audio.Albums.ALBUM_ART
+                + ", _id as rowid"
                 + " FROM audio TEMP"
                 + " WHERE is_music=1 AND is_pending=0 AND is_trashed=0"
                 + " AND volume_name IN " + filterVolumeNames
@@ -1490,6 +1493,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 + ", MIN(year) AS " + Audio.Albums.FIRST_YEAR
                 + ", MAX(year) AS " + Audio.Albums.LAST_YEAR
                 + ", NULL AS " + Audio.Albums.ALBUM_ART
+                + ", _id as rowid"
                 + " FROM audio"
                 + " WHERE is_music=1 AND is_pending=0 AND is_trashed=0"
                 + " AND volume_name IN " + filterVolumeNames
@@ -1498,13 +1502,14 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         db.execSQL("CREATE VIEW audio_genres AS SELECT "
                 + "  genre_id AS " + Audio.Genres._ID
                 + ", MIN(genre) AS " + Audio.Genres.NAME
+                + ", _id as rowid"
                 + " FROM audio"
                 + " WHERE is_pending=0 AND is_trashed=0 AND volume_name IN " + filterVolumeNames
                 + " GROUP BY genre_id");
     }
 
     private String getColumnsForCollection(Class<?> collection) {
-        return String.join(",", getProjectionMap(collection).keySet()) + ",_modifier";
+        return String.join(",", getProjectionMap(collection).keySet()) + ",_modifier,_id as rowid";
     }
 
     private static void makePristineTriggers(SQLiteDatabase db) {
@@ -1875,10 +1880,9 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
     static final int VERSION_Q = 1023;
     static final int VERSION_R = 1115;
     static final int VERSION_S = 1209;
-    // Leave some gaps in database version tagging to allow S schema changes
-    // to go independent of T schema changes.
     static final int VERSION_T = 1307;
-    public static final int VERSION_LATEST = VERSION_T;
+    static final int VERSION_U = 1400;
+    public static final int VERSION_LATEST = VERSION_U;
 
     /**
      * This method takes care of updating all the tables in the database to the
@@ -2073,6 +2077,9 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
             if (fromVersion < 1307) {
                 // This is to ensure Animated Webp files are tagged
                 updateSpecialFormatToNotDetected(db);
+            }
+            if (fromVersion < 1400) {
+                // Empty version bump to ensure views are recreated
             }
 
             // If this is the legacy database, it's not worth recomputing data
